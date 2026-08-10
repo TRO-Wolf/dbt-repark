@@ -1,0 +1,10 @@
+name: dbt_repark_sample
+version: 1.0.0
+config-version: 2
+profile: repark_mem
+
+model-paths: ["models"]
+
+# M0.3 — adapter recommends table; sample requires project-level default (stock dbt is view).
+models:
+  +materialized: table

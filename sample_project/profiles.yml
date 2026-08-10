@@ -1,0 +1,11 @@
+# Example only — placeholders. Do not commit real ARNs or secrets.
+repark_mem:
+  target: dev
+  outputs:
+    dev:
+      type: repark
+      catalog_type: memory
+      catalog_name: spark_catalog
+      warehouse: /tmp/dbt-repark-sample-wh
+      schema: default
+      threads: 1
