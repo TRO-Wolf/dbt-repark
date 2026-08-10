@@ -113,18 +113,12 @@
 {% endmacro %}
 
 {% macro repark__get_incremental_delete_insert_sql(arg_dict) %}
-  {# Multi-statement body; prefer repark materialization which splits executes. #}
-  {% set unique_key = arg_dict.get("unique_key") %}
-  {% set delete_sql = repark_get_incremental_delete_sql(
-        arg_dict["target_relation"],
-        arg_dict["temp_relation"],
-        unique_key,
-        arg_dict.get("incremental_predicates"),
-    ) %}
-  {% set insert_sql = repark_get_incremental_insert_sql(
-        arg_dict["target_relation"],
-        arg_dict["temp_relation"],
-        arg_dict["dest_columns"],
-    ) %}
-  {% do return(delete_sql ~ ';\n' ~ insert_sql) %}
+  {# Engine refuses multi-statement in one execute. delete+insert is intentionally
+     two statement() calls inside materialization incremental (adapter='repark').
+     Never emit delete;insert as a single build_sql string. #}
+  {% do exceptions.raise_compiler_error(
+    "dbt-repark delete+insert cannot run as a single SQL string (engine: one statement "
+    "per execute; strategy is two non-atomic executes). Use the repark incremental "
+    "materialization (materialized='incremental', incremental_strategy='delete+insert')."
+  ) %}
 {% endmacro %}

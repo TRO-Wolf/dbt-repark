@@ -159,6 +159,38 @@ def test_m1_3_delete_insert_residual_after_delete_failure() -> None:
     h.close()
 
 
+def test_m1_1_delete_insert_multi_key_arrow() -> None:
+    """Composite unique_key delete+insert via DISTINCT key projection."""
+    conn, _wh = _open_memory()
+    h = conn.handle
+    assert isinstance(h, ReparkConnectionHandle)
+    h.cursor().execute(
+        "create or replace table spark_catalog.default.m1_mk "
+        "using iceberg as "
+        "select 1 as a, 'x' as b, 10 as v union all select 2 as a, 'y' as b, 20 as v"
+    )
+    h.cursor().execute(
+        "create or replace table spark_catalog.default.m1_mk__dbt_tmp "
+        "using iceberg as select 1 as a, 'x' as b, 11 as v"
+    )
+    h.cursor().execute(
+        "merge into spark_catalog.default.m1_mk as DBT_INTERNAL_DEST "
+        "using ("
+        "  select distinct a, b from spark_catalog.default.m1_mk__dbt_tmp"
+        ") as DBT_INTERNAL_SOURCE "
+        "on DBT_INTERNAL_DEST.a = DBT_INTERNAL_SOURCE.a "
+        "and DBT_INTERNAL_DEST.b = DBT_INTERNAL_SOURCE.b "
+        "when matched then delete"
+    )
+    h.cursor().execute(
+        "insert into spark_catalog.default.m1_mk (a, b, v) "
+        "select a, b, v from spark_catalog.default.m1_mk__dbt_tmp"
+    )
+    out = _rows(h, "select a, b, v from spark_catalog.default.m1_mk order by a")
+    assert out == [(1, "x", 11), (2, "y", 20)], out
+    h.close()
+
+
 def test_m1_1_delete_insert_duplicate_batch_keys() -> None:
     """Duplicate unique_key rows in the batch must not fail the delete half."""
     conn, _wh = _open_memory()
@@ -205,6 +237,8 @@ def test_m1_2_strategy_macros_refuse_pins() -> None:
     assert "select distinct" in text.lower()
     assert "when matched then delete" in text.lower()
     assert "when not matched" not in text.lower()
+    # Fallback macro must refuse single-string multi-statement (engine one-execute rule).
+    assert "cannot run as a single SQL string" in text
     mat = ROOT / "src/dbt/include/repark/macros/materializations/incremental.sql"
     mtext = mat.read_text(encoding="utf-8")
     assert "{% materialization incremental, adapter='repark' %}" in mtext
