@@ -22,6 +22,13 @@
   {%- set incremental_strategy = 'append'
         if (raw_strategy | trim | lower) in ['append', 'default']
         else (raw_strategy | trim | lower) -%}
+  {# Fail loud before staging work when delete+insert lacks unique_key. #}
+  {% if incremental_strategy == 'delete+insert' and not unique_key %}
+    {% do exceptions.raise_compiler_error(
+      "dbt-repark incremental strategy 'delete+insert' requires config unique_key "
+      "(one column name or list of column names)."
+    ) %}
+  {% endif %}
 
   {%- set preexisting_intermediate_relation = load_cached_relation(intermediate_relation) -%}
   {%- set preexisting_backup_relation = load_cached_relation(backup_relation) -%}
@@ -63,12 +70,7 @@
         {{ repark_get_incremental_append_sql(target_relation, temp_relation, dest_columns) }}
       {%- endcall %}
     {% elif incremental_strategy == 'delete+insert' %}
-      {% if not unique_key %}
-        {% do exceptions.raise_compiler_error(
-          "dbt-repark incremental strategy 'delete+insert' requires config unique_key "
-          "(one column name or list of column names)."
-        ) %}
-      {% endif %}
+      {# unique_key validated above before staging #}
 
       {# Execute 1 of 2: delete matching keys (eager; not rolled back on later failure). #}
       {% set delete_sql = repark_get_incremental_delete_sql(

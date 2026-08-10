@@ -313,6 +313,24 @@ def _run_dbt(project: Path, profiles: Path, *extra: str) -> subprocess.Completed
     return subprocess.run(cmd, cwd=str(project), env=env, capture_output=True, text=True, check=False)
 
 
+def test_m1_2_dbt_run_refuses_delete_insert_without_unique_key(tmp_path: Path) -> None:
+    project = tmp_path / "proj_uk"
+    model = textwrap.dedent(
+        """
+        {{ config(
+            materialized='incremental',
+            incremental_strategy='delete+insert',
+        ) }}
+        select 1 as id
+        """
+    )
+    profiles = _write_mini_project(project, model_sql=model)
+    proc = _run_dbt(project, profiles)
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode != 0, combined
+    assert "unique_key" in combined.lower(), combined
+
+
 @pytest.mark.parametrize(
     ("strategy", "needle"),
     [
