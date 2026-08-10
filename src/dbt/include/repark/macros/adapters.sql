@@ -13,11 +13,8 @@
 {% endmacro %}
 
 {% macro repark__create_table_as(temporary, relation, sql) -%}
-  {%- if temporary -%}
-    {{ exceptions.raise_compiler_error(
-      "dbt-repark does not support temporary tables in M0; use ephemeral models or a durable table"
-    ) }}
-  {%- endif -%}
+  {# Engine has no TEMP TABLE / TEMP VIEW. "temporary" relations are durable Iceberg
+     tables with a dbt temp suffix and must be dropped by the materialization. #}
   create or replace table {{ relation }}
   using iceberg
   as

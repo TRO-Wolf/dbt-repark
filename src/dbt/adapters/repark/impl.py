@@ -25,6 +25,10 @@ class ReparkAdapter(SQLAdapter):
     def date_function(cls) -> str:
         return "current_timestamp()"
 
+    def valid_incremental_strategies(self) -> list[str]:
+        """G3-M1a: append + delete+insert only (merge → M2; insert_overwrite → OQ-5)."""
+        return ["append", "delete+insert"]
+
     @classmethod
     def is_cancelable(cls) -> bool:
         return False
