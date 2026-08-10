@@ -23,7 +23,7 @@ dependencies = [
   "dbt-adapters>=1.10,<2",
   "pyarrow>=25.0.0",
   # repark: path/editable/git@SHA only until a real public release — never PyPI 0.0.1.
-  # Install separately: path into LocalRepark/repark after `make develop`.
+  # Install separately: editable/path install of a locally built repark (see README).
 ]
 
 [project.optional-dependencies]
