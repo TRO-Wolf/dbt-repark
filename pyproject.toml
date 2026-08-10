@@ -1,0 +1,52 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dbt-repark"
+version = "0.1.0a1"
+description = "dbt adapter for the repark pure-Rust Iceberg engine (embedded, no JVM)"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+authors = [{ name = "TRO-Wolf" }]
+keywords = ["dbt", "adapter", "repark", "iceberg"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+  "dbt-core>=1.8,<2",
+  "dbt-adapters>=1.10,<2",
+  "pyarrow>=25.0.0",
+  # repark: path/editable/git@SHA only until a real public release — never PyPI 0.0.1.
+  # Install separately: path into LocalRepark/repark after `make develop`.
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.9",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dbt"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/dbt", "README.md", "LICENSE", "sample_project", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B", "SIM", "C4", "PTH", "RUF", "N", "ANN"]
+ignore = ["ANN401"]
