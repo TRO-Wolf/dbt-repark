@@ -55,9 +55,10 @@ Each `execute` is **one** engine `sql()` with **eager** commit. `begin`/`commit`
 **`delete+insert` residual:** that strategy is **two** executes (delete matching keys, then
 insert the batch). If the process fails **after** delete and **before** insert, the residual
 state is real and **cannot be rolled back**: rows whose `unique_key` appeared in the batch are
-already gone; nothing from that batch was inserted. Unit tests pin this (M1.3); ops must
-re-run or repair manually. Prefer single-statement strategies (future `merge` in G3-M2) when
-atomicity of the upsert matters.
+already gone; nothing from that batch was inserted. The durable `__dbt_tmp` staging table from
+that run is also left behind (materialization cleanup only runs after a successful path). Unit
+tests pin this (M1.3); ops must re-run or repair manually. Prefer single-statement strategies
+(future `merge` in G3-M2) when atomicity of the upsert matters.
 
 ## Materializations (M0–M1a)
 
@@ -83,7 +84,10 @@ atomicity of the upsert matters.
 **not** the G3-M2 merge incremental strategy (no combined upsert in one statement).
 
 Staging relations are **durable** Iceberg tables (`__dbt_tmp` suffix); the engine has no
-`TEMP TABLE` / `TEMP VIEW`. Materializations drop them after use.
+`TEMP TABLE` / `TEMP VIEW`. Materializations call `create_table_as(False, …)` for staging and
+drop temps after a successful run. **`create_table_as(temporary=True)` is refused loud** (M0
+pin restored) — there is no session-scoped temp table path. Optional `incremental_predicates`
+/`predicates` are plumbed into the delete+insert ON clause but not e2e-gated in M1a (G3-M2).
 
 **Required project config** (dbt core `NodeConfig` still hard-defaults models to `view`;
 this adapter cannot change that core default, so projects **must** set a non-view default):

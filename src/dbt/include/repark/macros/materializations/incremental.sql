@@ -3,6 +3,7 @@
     G3-M1a: append + delete+insert only.
     delete+insert is two separate executes (not atomic — plan §1.5).
     Failure after delete leaves matching keys removed and nothing inserted.
+    Injected failure (repark_fail_after_delete) also leaves the durable __dbt_tmp staging table.
   #}
 
   {%- set existing_relation = load_cached_relation(this) -%}

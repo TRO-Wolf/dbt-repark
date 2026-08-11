@@ -13,8 +13,16 @@
 {% endmacro %}
 
 {% macro repark__create_table_as(temporary, relation, sql) -%}
-  {# Engine has no TEMP TABLE / TEMP VIEW. "temporary" relations are durable Iceberg
-     tables with a dbt temp suffix and must be dropped by the materialization. #}
+  {# Engine has no TEMP TABLE / TEMP VIEW. Staging uses durable Iceberg tables with a
+     dbt temp/intermediate suffix and temporary=False (materializations drop them).
+     temporary=True remains a loud refuse (M0 pin) — not a silent TEMP TABLE. #}
+  {%- if temporary -%}
+    {{ exceptions.raise_compiler_error(
+      "dbt-repark does not support temporary tables (engine has no TEMP TABLE / TEMP VIEW). "
+      "Use ephemeral models, or durable staging via create_table_as(False, temp_relation, …) "
+      "with a dbt temp suffix (incremental materialization does this)."
+    ) }}
+  {%- endif -%}
   create or replace table {{ relation }}
   using iceberg
   as
@@ -28,8 +36,9 @@
 {% endmacro %}
 
 {% macro repark__rename_relation(from_relation, to_relation) -%}
+  {# Engine requires a three-part catalog.namespace.table target name (bare identifier fails). #}
   {% call statement('rename_relation') -%}
-    alter table {{ from_relation }} rename to {{ to_relation.identifier }}
+    alter table {{ from_relation }} rename to {{ to_relation }}
   {%- endcall %}
 {% endmacro %}
 

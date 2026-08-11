@@ -41,10 +41,9 @@ def _find_static_credential_keys(data: dict[str, Any], *, prefix: str = "") -> l
             hits.append(path)
             continue
         if isinstance(value, dict):
-            if lower in _STATIC_CREDENTIAL_NESTED:
-                # Any non-empty nested credential block is refused (even if keys are unknown).
-                if value:
-                    hits.append(path)
+            # Any non-empty nested credential block is refused (even if keys are unknown).
+            if lower in _STATIC_CREDENTIAL_NESTED and value:
+                hits.append(path)
             hits.extend(_find_static_credential_keys(value, prefix=path))
     return hits
 

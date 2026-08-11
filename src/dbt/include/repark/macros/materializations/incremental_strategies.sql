@@ -61,6 +61,10 @@
 
     Source side is SELECT DISTINCT on unique_key columns so duplicate batch keys do not
     trip MERGE_CARDINALITY_VIOLATION.
+
+    incremental_predicates / predicates: optional extra ON-clause fragments plumbed through
+    (same shape as stock dbt delete+insert). Accepted and appended here; no dedicated e2e
+    pin in M1a — exercise or gate further in G3-M2 if productized.
   #}
   {%- if unique_key is string -%}
     {%- set unique_key_list = [unique_key] -%}

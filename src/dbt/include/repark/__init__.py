@@ -1,3 +1,3 @@
-import os
+from pathlib import Path
 
-PACKAGE_PATH = os.path.dirname(__file__)
+PACKAGE_PATH = str(Path(__file__).parent)

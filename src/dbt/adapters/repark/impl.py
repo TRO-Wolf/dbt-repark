@@ -26,7 +26,13 @@ class ReparkAdapter(SQLAdapter):
         return "current_timestamp()"
 
     def valid_incremental_strategies(self) -> list[str]:
-        """G3-M1a: append + delete+insert only (merge → M2; insert_overwrite → OQ-5)."""
+        """G3-M1a strategies for dbt strategy discovery (append + delete+insert).
+
+        Dead-surface note: dbt may consult this list for discovery/help, but the live
+        enforcement gate is ``repark_validate_incremental_strategy`` in the repark
+        incremental materialization (merge → G3-M2; insert_overwrite → OQ-5; other refuse).
+        Do not treat this Python method as the sole strategy gate.
+        """
         return ["append", "delete+insert"]
 
     @classmethod

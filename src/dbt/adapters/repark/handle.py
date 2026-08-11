@@ -48,8 +48,9 @@ class ReparkCursor:
         if self._table is None:
             return []
         rows: list[tuple[Any, ...]] = []
+        n_cols = self._table.num_columns
         for i in range(self._table.num_rows):
-            rows.append(tuple(self._table.column(j)[i].as_py() for j in range(self._table.num_columns)))
+            rows.append(tuple(self._table.column(j)[i].as_py() for j in range(n_cols)))
         self._row_index = self._table.num_rows
         return rows
 
@@ -58,8 +59,9 @@ class ReparkCursor:
             return []
         end = min(self._row_index + size, self._table.num_rows)
         rows: list[tuple[Any, ...]] = []
+        n_cols = self._table.num_columns
         for i in range(self._row_index, end):
-            rows.append(tuple(self._table.column(j)[i].as_py() for j in range(self._table.num_columns)))
+            rows.append(tuple(self._table.column(j)[i].as_py() for j in range(n_cols)))
         self._row_index = end
         return rows
 

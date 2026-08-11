@@ -1,4 +1,4 @@
-"""G3-M1a: append + delete+insert strategy plumbing (memory catalog; no persistence claim)."""
+"""G3-M1a: real append + delete+insert materialization tests (memory; no persist claim)."""
 
 from __future__ import annotations
 
@@ -7,7 +7,11 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
+from datetime import date, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -15,6 +19,7 @@ pytest.importorskip("repark")
 pytest.importorskip("dbt.cli.main")
 
 from dbt.adapters.contracts.connection import Connection, ConnectionState
+from dbt.cli.main import dbtRunner
 
 from dbt.adapters.repark.connections import ReparkConnectionManager
 from dbt.adapters.repark.credentials import ReparkCredentials
@@ -49,202 +54,62 @@ def _rows(handle: ReparkConnectionHandle, sql: str) -> list[tuple[object, ...]]:
     return cur.fetchall()
 
 
-def test_valid_incremental_strategies_pin() -> None:
-    # Unbound call — method does not use instance state.
-    strategies = ReparkAdapter.valid_incremental_strategies(None)  # type: ignore[arg-type]
-    assert strategies == ["append", "delete+insert"]
+def _session_rows(session: Any, sql: str) -> list[tuple[object, ...]]:
+    table = session.sql(sql).to_arrow()
+    out: list[tuple[object, ...]] = []
+    for i in range(table.num_rows):
+        out.append(tuple(table.column(j)[i].as_py() for j in range(table.num_columns)))
+    return out
 
 
-def test_m1_1_append_second_run_arrow() -> None:
-    """Append: first CTAS, second INSERT; row counts + keys via Arrow (memory only)."""
-    conn, _wh = _open_memory()
-    h = conn.handle
-    assert isinstance(h, ReparkConnectionHandle)
-
-    h.cursor().execute(
-        "create or replace table spark_catalog.default.m1_append "
-        "using iceberg as select 1 as id, 'a' as v"
-    )
-    assert _rows(h, "select id, v from spark_catalog.default.m1_append order by id") == [
-        (1, "a")
-    ]
-
-    # Second incremental batch staging + append insert (strategy plumbing).
-    h.cursor().execute(
-        "create or replace table spark_catalog.default.m1_append__dbt_tmp "
-        "using iceberg as select 2 as id, 'b' as v union all select 3 as id, 'c' as v"
-    )
-    h.cursor().execute(
-        "insert into spark_catalog.default.m1_append (id, v) "
-        "select id, v from spark_catalog.default.m1_append__dbt_tmp"
-    )
-    out = _rows(h, "select id, v from spark_catalog.default.m1_append order by id")
-    assert out == [(1, "a"), (2, "b"), (3, "c")]
-    assert len(out) == 3
-    h.close()
+def _session_table_names(session: Any) -> set[str]:
+    catalog = getattr(session, "catalog", None)
+    if catalog is not None and hasattr(catalog, "listTables"):
+        names: set[str] = set()
+        for item in catalog.listTables("default"):
+            if isinstance(item, str):
+                names.add(item)
+            else:
+                name = getattr(item, "name", None)
+                if name is not None:
+                    names.add(str(name))
+        return names
+    return set()
 
 
-def test_m1_1_delete_insert_second_run_arrow() -> None:
-    """delete+insert: delete matching keys then insert batch; key-level Arrow checks."""
-    conn, _wh = _open_memory()
-    h = conn.handle
-    assert isinstance(h, ReparkConnectionHandle)
+@contextmanager
+def _shared_memory_session() -> Iterator[dict[str, Any]]:
+    """Reuse one memory-catalog session across dbtRunner invokes (process-local catalog).
 
-    h.cursor().execute(
-        "create or replace table spark_catalog.default.m1_di "
-        "using iceberg as "
-        "select 1 as id, 'keep' as v union all select 2 as id, 'old' as v"
-    )
-    h.cursor().execute(
-        "create or replace table spark_catalog.default.m1_di__dbt_tmp "
-        "using iceberg as "
-        "select 2 as id, 'new' as v union all select 3 as id, 'added' as v"
-    )
-    # Execute 1: delete vehicle (MERGE WHEN MATCHED THEN DELETE) — not M2 upsert.
-    h.cursor().execute(
-        "merge into spark_catalog.default.m1_di as DBT_INTERNAL_DEST "
-        "using ("
-        "  select distinct id from spark_catalog.default.m1_di__dbt_tmp"
-        ") as DBT_INTERNAL_SOURCE "
-        "on DBT_INTERNAL_DEST.id = DBT_INTERNAL_SOURCE.id "
-        "when matched then delete"
-    )
-    mid = _rows(h, "select id, v from spark_catalog.default.m1_di order by id")
-    assert mid == [(1, "keep")]
+    Memory catalogs are empty per new ReparkSession. Tests that need a real second
+    incremental run share one session and soft-close handles so dbt does not stop it.
+    """
+    shared: dict[str, Any] = {}
+    orig_open = ReparkConnectionManager._open_session.__func__  # type: ignore[attr-defined]
+    orig_close = ReparkConnectionHandle.close
 
-    # Execute 2: insert batch
-    h.cursor().execute(
-        "insert into spark_catalog.default.m1_di (id, v) "
-        "select id, v from spark_catalog.default.m1_di__dbt_tmp"
-    )
-    out = _rows(h, "select id, v from spark_catalog.default.m1_di order by id")
-    assert out == [(1, "keep"), (2, "new"), (3, "added")]
-    h.close()
+    def shared_open(cls: type, credentials: ReparkCredentials) -> Any:
+        key = str(credentials.warehouse or "default")
+        if key not in shared:
+            shared[key] = orig_open(cls, credentials)
+        return shared[key]
 
+    def soft_close(self: ReparkConnectionHandle) -> None:
+        # Mark closed for dbt lifecycle without stopping the shared process session.
+        self._closed = True
 
-def test_m1_3_delete_insert_residual_after_delete_failure() -> None:
-    """M1.3: fail after delete → residual = keys deleted, nothing inserted (§1.5)."""
-    conn, _wh = _open_memory()
-    h = conn.handle
-    assert isinstance(h, ReparkConnectionHandle)
-
-    h.cursor().execute(
-        "create or replace table spark_catalog.default.m1_residual "
-        "using iceberg as "
-        "select 1 as id, 'keep' as v union all select 2 as id, 'old' as v "
-        "union all select 4 as id, 'also_keep' as v"
-    )
-    h.cursor().execute(
-        "create or replace table spark_catalog.default.m1_residual__dbt_tmp "
-        "using iceberg as "
-        "select 2 as id, 'new' as v union all select 3 as id, 'added' as v"
-    )
-    # Macro shape: DISTINCT keys source (avoids MERGE_CARDINALITY_VIOLATION).
-    h.cursor().execute(
-        "merge into spark_catalog.default.m1_residual as DBT_INTERNAL_DEST "
-        "using ("
-        "  select distinct id from spark_catalog.default.m1_residual__dbt_tmp"
-        ") as DBT_INTERNAL_SOURCE "
-        "on DBT_INTERNAL_DEST.id = DBT_INTERNAL_SOURCE.id "
-        "when matched then delete"
-    )
-    # Injected failure: do not run insert. Residual is real and non-atomic.
-    residual = _rows(
-        h, "select id, v from spark_catalog.default.m1_residual order by id"
-    )
-    assert residual == [(1, "keep"), (4, "also_keep")], residual
-    ids = {r[0] for r in residual}
-    assert 2 not in ids  # deleted
-    assert 3 not in ids  # never inserted
-    h.close()
-
-
-def test_m1_1_delete_insert_multi_key_arrow() -> None:
-    """Composite unique_key delete+insert via DISTINCT key projection."""
-    conn, _wh = _open_memory()
-    h = conn.handle
-    assert isinstance(h, ReparkConnectionHandle)
-    h.cursor().execute(
-        "create or replace table spark_catalog.default.m1_mk "
-        "using iceberg as "
-        "select 1 as a, 'x' as b, 10 as v union all select 2 as a, 'y' as b, 20 as v"
-    )
-    h.cursor().execute(
-        "create or replace table spark_catalog.default.m1_mk__dbt_tmp "
-        "using iceberg as select 1 as a, 'x' as b, 11 as v"
-    )
-    h.cursor().execute(
-        "merge into spark_catalog.default.m1_mk as DBT_INTERNAL_DEST "
-        "using ("
-        "  select distinct a, b from spark_catalog.default.m1_mk__dbt_tmp"
-        ") as DBT_INTERNAL_SOURCE "
-        "on DBT_INTERNAL_DEST.a = DBT_INTERNAL_SOURCE.a "
-        "and DBT_INTERNAL_DEST.b = DBT_INTERNAL_SOURCE.b "
-        "when matched then delete"
-    )
-    h.cursor().execute(
-        "insert into spark_catalog.default.m1_mk (a, b, v) "
-        "select a, b, v from spark_catalog.default.m1_mk__dbt_tmp"
-    )
-    out = _rows(h, "select a, b, v from spark_catalog.default.m1_mk order by a")
-    assert out == [(1, "x", 11), (2, "y", 20)], out
-    h.close()
-
-
-def test_m1_1_delete_insert_duplicate_batch_keys() -> None:
-    """Duplicate unique_key rows in the batch must not fail the delete half."""
-    conn, _wh = _open_memory()
-    h = conn.handle
-    assert isinstance(h, ReparkConnectionHandle)
-    h.cursor().execute(
-        "create or replace table spark_catalog.default.m1_dup "
-        "using iceberg as select 1 as id, 'a' as v union all select 2 as id, 'old' as v"
-    )
-    h.cursor().execute(
-        "create or replace table spark_catalog.default.m1_dup__dbt_tmp "
-        "using iceberg as "
-        "select 2 as id, 'n1' as v union all select 2 as id, 'n2' as v "
-        "union all select 3 as id, 'c' as v"
-    )
-    h.cursor().execute(
-        "merge into spark_catalog.default.m1_dup as DBT_INTERNAL_DEST "
-        "using ("
-        "  select distinct id from spark_catalog.default.m1_dup__dbt_tmp"
-        ") as DBT_INTERNAL_SOURCE "
-        "on DBT_INTERNAL_DEST.id = DBT_INTERNAL_SOURCE.id "
-        "when matched then delete"
-    )
-    h.cursor().execute(
-        "insert into spark_catalog.default.m1_dup (id, v) "
-        "select id, v from spark_catalog.default.m1_dup__dbt_tmp"
-    )
-    out = _rows(h, "select id, v from spark_catalog.default.m1_dup order by id, v")
-    # Both batch rows for id=2 are appended after delete (append semantics of insert half).
-    assert out == [(1, "a"), (2, "n1"), (2, "n2"), (3, "c")], out
-    h.close()
-
-
-def test_m1_2_strategy_macros_refuse_pins() -> None:
-    """Macro source pins for loud refuse messages (merge / insert_overwrite / other)."""
-    path = ROOT / "src/dbt/include/repark/macros/materializations/incremental_strategies.sql"
-    text = path.read_text(encoding="utf-8")
-    assert "repark_validate_incremental_strategy" in text
-    assert "G3-M2" in text
-    assert "OQ-5" in text
-    assert "insert_overwrite" in text
-    assert "microbatch" in text
-    # Delete vehicle must DISTINCT keys (MERGE cardinality) and not claim M2 upsert.
-    assert "select distinct" in text.lower()
-    assert "when matched then delete" in text.lower()
-    assert "when not matched" not in text.lower()
-    # Fallback macro must refuse single-string multi-statement (engine one-execute rule).
-    assert "cannot run as a single SQL string" in text
-    mat = ROOT / "src/dbt/include/repark/macros/materializations/incremental.sql"
-    mtext = mat.read_text(encoding="utf-8")
-    assert "{% materialization incremental, adapter='repark' %}" in mtext
-    assert "repark_fail_after_delete" in mtext
-    assert "delete+insert" in mtext
-    assert "§1.5" in mtext or "1.5" in mtext or "not atomic" in mtext.lower() or "no-op" in mtext
+    ReparkConnectionManager._open_session = classmethod(shared_open)  # type: ignore[method-assign]
+    ReparkConnectionHandle.close = soft_close  # type: ignore[method-assign]
+    try:
+        yield shared
+    finally:
+        ReparkConnectionManager._open_session = classmethod(orig_open)  # type: ignore[method-assign]
+        ReparkConnectionHandle.close = orig_close  # type: ignore[method-assign]
+        for sess in shared.values():
+            stop = getattr(sess, "stop", None)
+            if callable(stop):
+                with suppress(Exception):
+                    stop()
 
 
 def _write_mini_project(
@@ -260,7 +125,7 @@ def _write_mini_project(
         model_sql.strip() + "\n", encoding="utf-8"
     )
     dbt_project = textwrap.dedent(
-        f"""
+        """
         name: m1a_inc_test
         version: 1.0.0
         config-version: 2
@@ -295,7 +160,9 @@ def _write_mini_project(
     return profiles
 
 
-def _run_dbt(project: Path, profiles: Path, *extra: str) -> subprocess.CompletedProcess[str]:
+def _run_dbt_subprocess(
+    project: Path, profiles: Path, *extra: str
+) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["DBT_PROFILES_DIR"] = str(profiles.parent)
     src = str(ROOT / "src")
@@ -310,7 +177,410 @@ def _run_dbt(project: Path, profiles: Path, *extra: str) -> subprocess.Completed
         str(profiles.parent),
         *extra,
     ]
-    return subprocess.run(cmd, cwd=str(project), env=env, capture_output=True, text=True, check=False)
+    return subprocess.run(
+        cmd, cwd=str(project), env=env, capture_output=True, text=True, check=False
+    )
+
+
+def _dbt_invoke(
+    project: Path,
+    profiles: Path,
+    *extra: str,
+    callbacks: list[Any] | None = None,
+) -> tuple[Any, list[str]]:
+    """In-process dbtRunner.invoke; returns (result, captured event messages)."""
+    msgs: list[str] = []
+
+    def _cb(event: Any) -> None:
+        try:
+            msgs.append(str(event.info.msg))
+        except Exception:
+            msgs.append(str(event))
+
+    cbs = list(callbacks or [])
+    cbs.append(_cb)
+    # Ensure adapter package is importable for the runner process (same interpreter).
+    src = str(ROOT / "src")
+    if src not in sys.path:
+        sys.path.insert(0, src)
+    runner = dbtRunner(callbacks=cbs)
+    result = runner.invoke(
+        [
+            "run",
+            "--project-dir",
+            str(project),
+            "--profiles-dir",
+            str(profiles.parent),
+            *extra,
+        ]
+    )
+    return result, msgs
+
+
+def test_valid_incremental_strategies_pin() -> None:
+    # Unbound call — method does not use instance state (discovery surface only).
+    strategies = ReparkAdapter.valid_incremental_strategies(None)  # type: ignore[arg-type]
+    assert strategies == ["append", "delete+insert"]
+    doc = ReparkAdapter.valid_incremental_strategies.__doc__ or ""
+    assert "Dead-surface" in doc or "sole strategy gate" in doc
+
+
+# ---------------------------------------------------------------------------
+# M1.1 — real materialization, dbtRunner twice, Arrow row/key checks
+# ---------------------------------------------------------------------------
+
+
+def test_m1_1_append_dbt_runner_twice_arrow(tmp_path: Path) -> None:
+    """Append: two dbtRunner invokes through the real incremental mat; Arrow keys."""
+    project = tmp_path / "proj_append"
+    model = textwrap.dedent(
+        """
+        {{ config(
+            materialized='incremental',
+            incremental_strategy='append',
+        ) }}
+        select 1 as id, 'a' as v
+        """
+    )
+    profiles = _write_mini_project(project, model_sql=model, model_name="inc_append")
+
+    with _shared_memory_session() as shared:
+        r1, _ = _dbt_invoke(project, profiles)
+        assert r1.success, r1.exception
+
+        (project / "models" / "inc_append.sql").write_text(
+            textwrap.dedent(
+                """
+                {{ config(
+                    materialized='incremental',
+                    incremental_strategy='append',
+                ) }}
+                select 2 as id, 'b' as v
+                union all
+                select 3 as id, 'c' as v
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        r2, _ = _dbt_invoke(project, profiles)
+        assert r2.success, r2.exception
+
+        session = next(iter(shared.values()))
+        out = _session_rows(
+            session,
+            "select id, v from spark_catalog.default.inc_append order by id",
+        )
+        assert out == [(1, "a"), (2, "b"), (3, "c")], out
+        assert len(out) == 3
+        names = _session_table_names(session)
+        assert "inc_append" in names
+        assert not any(n.endswith("__dbt_tmp") for n in names), names
+
+
+def test_m1_1_delete_insert_dbt_runner_twice_arrow(tmp_path: Path) -> None:
+    """delete+insert: second run through real mat; keep / replace / add key checks."""
+    project = tmp_path / "proj_di"
+    model = textwrap.dedent(
+        """
+        {{ config(
+            materialized='incremental',
+            incremental_strategy='delete+insert',
+            unique_key='id',
+        ) }}
+        select 1 as id, 'keep' as v
+        union all
+        select 2 as id, 'old' as v
+        """
+    )
+    profiles = _write_mini_project(project, model_sql=model, model_name="inc_di")
+
+    with _shared_memory_session() as shared:
+        r1, _ = _dbt_invoke(project, profiles)
+        assert r1.success, r1.exception
+
+        (project / "models" / "inc_di.sql").write_text(
+            textwrap.dedent(
+                """
+                {{ config(
+                    materialized='incremental',
+                    incremental_strategy='delete+insert',
+                    unique_key='id',
+                ) }}
+                select 2 as id, 'new' as v
+                union all
+                select 3 as id, 'added' as v
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        r2, _ = _dbt_invoke(project, profiles)
+        assert r2.success, r2.exception
+
+        session = next(iter(shared.values()))
+        out = _session_rows(
+            session,
+            "select id, v from spark_catalog.default.inc_di order by id",
+        )
+        assert out == [(1, "keep"), (2, "new"), (3, "added")], out
+
+
+def test_m1_1_delete_insert_multi_key_dbt_runner(tmp_path: Path) -> None:
+    """Composite unique_key delete+insert through the real materialization."""
+    project = tmp_path / "proj_mk"
+    model = textwrap.dedent(
+        """
+        {{ config(
+            materialized='incremental',
+            incremental_strategy='delete+insert',
+            unique_key=['a', 'b'],
+        ) }}
+        select 1 as a, 'x' as b, 10 as v
+        union all
+        select 2 as a, 'y' as b, 20 as v
+        """
+    )
+    profiles = _write_mini_project(project, model_sql=model, model_name="inc_mk")
+
+    with _shared_memory_session() as shared:
+        r1, _ = _dbt_invoke(project, profiles)
+        assert r1.success, r1.exception
+
+        (project / "models" / "inc_mk.sql").write_text(
+            textwrap.dedent(
+                """
+                {{ config(
+                    materialized='incremental',
+                    incremental_strategy='delete+insert',
+                    unique_key=['a', 'b'],
+                ) }}
+                select 1 as a, 'x' as b, 11 as v
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        r2, _ = _dbt_invoke(project, profiles)
+        assert r2.success, r2.exception
+
+        session = next(iter(shared.values()))
+        out = _session_rows(
+            session,
+            "select a, b, v from spark_catalog.default.inc_mk order by a",
+        )
+        assert out == [(1, "x", 11), (2, "y", 20)], out
+
+
+def test_m1_1_delete_insert_duplicate_batch_keys_dbt_runner(tmp_path: Path) -> None:
+    """Duplicate unique_key rows in the batch must not fail the delete half (real mat)."""
+    project = tmp_path / "proj_dup"
+    model = textwrap.dedent(
+        """
+        {{ config(
+            materialized='incremental',
+            incremental_strategy='delete+insert',
+            unique_key='id',
+        ) }}
+        select 1 as id, 'a' as v
+        union all
+        select 2 as id, 'old' as v
+        """
+    )
+    profiles = _write_mini_project(project, model_sql=model, model_name="inc_dup")
+
+    with _shared_memory_session() as shared:
+        r1, _ = _dbt_invoke(project, profiles)
+        assert r1.success, r1.exception
+
+        (project / "models" / "inc_dup.sql").write_text(
+            textwrap.dedent(
+                """
+                {{ config(
+                    materialized='incremental',
+                    incremental_strategy='delete+insert',
+                    unique_key='id',
+                ) }}
+                select 2 as id, 'n1' as v
+                union all
+                select 2 as id, 'n2' as v
+                union all
+                select 3 as id, 'c' as v
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        r2, _ = _dbt_invoke(project, profiles)
+        assert r2.success, r2.exception
+
+        session = next(iter(shared.values()))
+        out = _session_rows(
+            session,
+            "select id, v from spark_catalog.default.inc_dup order by id, v",
+        )
+        assert out == [(1, "a"), (2, "n1"), (2, "n2"), (3, "c")], out
+
+
+def test_m1_1_full_refresh_rename_fqn(tmp_path: Path) -> None:
+    """Full-refresh swap uses fully-qualified rename targets (A3 small FQN fix)."""
+    project = tmp_path / "proj_fr"
+    model = textwrap.dedent(
+        """
+        {{ config(
+            materialized='incremental',
+            incremental_strategy='append',
+        ) }}
+        select 1 as id, 'a' as v
+        """
+    )
+    profiles = _write_mini_project(project, model_sql=model, model_name="inc_fr")
+
+    with _shared_memory_session() as shared:
+        r1, _ = _dbt_invoke(project, profiles)
+        assert r1.success, r1.exception
+
+        (project / "models" / "inc_fr.sql").write_text(
+            textwrap.dedent(
+                """
+                {{ config(
+                    materialized='incremental',
+                    incremental_strategy='append',
+                ) }}
+                select 9 as id, 'full' as v
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        r2, _ = _dbt_invoke(project, profiles, "--full-refresh")
+        assert r2.success, r2.exception
+
+        session = next(iter(shared.values()))
+        out = _session_rows(
+            session,
+            "select id, v from spark_catalog.default.inc_fr order by id",
+        )
+        assert out == [(9, "full")], out
+        names = _session_table_names(session)
+        assert "inc_fr" in names
+        assert not any("__dbt_tmp" in n or "__dbt_backup" in n for n in names), names
+
+
+# ---------------------------------------------------------------------------
+# M1.3 — executed failure injection + residual assertion
+# ---------------------------------------------------------------------------
+
+
+def test_m1_3_fail_after_delete_run_residual(tmp_path: Path) -> None:
+    """Run fails after delete; residual = keys deleted, nothing inserted; __dbt_tmp left."""
+    project = tmp_path / "proj_residual"
+    model = textwrap.dedent(
+        """
+        {{ config(
+            materialized='incremental',
+            incremental_strategy='delete+insert',
+            unique_key='id',
+        ) }}
+        select 1 as id, 'keep' as v
+        union all
+        select 2 as id, 'old' as v
+        union all
+        select 4 as id, 'also_keep' as v
+        """
+    )
+    profiles = _write_mini_project(project, model_sql=model, model_name="inc_res")
+
+    with _shared_memory_session() as shared:
+        r1, _ = _dbt_invoke(project, profiles)
+        assert r1.success, r1.exception
+
+        (project / "models" / "inc_res.sql").write_text(
+            textwrap.dedent(
+                """
+                {{ config(
+                    materialized='incremental',
+                    incremental_strategy='delete+insert',
+                    unique_key='id',
+                ) }}
+                select 2 as id, 'new' as v
+                union all
+                select 3 as id, 'added' as v
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        r2, msgs = _dbt_invoke(
+            project,
+            profiles,
+            "--vars",
+            "{repark_fail_after_delete: true}",
+        )
+        assert not r2.success, "expected injected failure after delete"
+        joined = "\n".join(msgs)
+        assert "repark_fail_after_delete" in joined or "injected failure after delete" in joined, (
+            joined
+        )
+
+        session = next(iter(shared.values()))
+        residual = _session_rows(
+            session,
+            "select id, v from spark_catalog.default.inc_res order by id",
+        )
+        assert residual == [(1, "keep"), (4, "also_keep")], residual
+        ids = {r[0] for r in residual}
+        assert 2 not in ids  # deleted
+        assert 3 not in ids  # never inserted
+
+        names = _session_table_names(session)
+        # Durable staging left behind after injected failure (documented residual).
+        assert any(n.endswith("__dbt_tmp") for n in names), names
+
+
+def test_m1_3_fail_after_delete_hook_order_pin() -> None:
+    """Materialization source order: delete statement → inject → insert (main)."""
+    mat = (
+        ROOT / "src/dbt/include/repark/macros/materializations/incremental.sql"
+    ).read_text(encoding="utf-8")
+    assert "repark_fail_after_delete" in mat
+    assert "injected failure after delete" in mat
+    assert "cannot be rolled back" in mat or "no-op" in mat
+    assert "__dbt_tmp" in mat  # staging residual documented in mat comment
+    delete_pos = mat.find("statement('delete')")
+    # var()/config get of the inject flag (not the header comment mention).
+    inject_pos = mat.find("var('repark_fail_after_delete'")
+    if inject_pos < 0:
+        inject_pos = mat.find("repark_fail_after_delete", delete_pos)
+    main_pos = mat.find("statement('main')", inject_pos)
+    assert 0 <= delete_pos < inject_pos < main_pos, (delete_pos, inject_pos, main_pos)
+
+
+# ---------------------------------------------------------------------------
+# M1.2 — refuse pins (executed)
+# ---------------------------------------------------------------------------
+
+
+def test_m1_2_strategy_macros_source_pins() -> None:
+    """Macro source pins for loud refuse messages + delete vehicle shape."""
+    path = ROOT / "src/dbt/include/repark/macros/materializations/incremental_strategies.sql"
+    text = path.read_text(encoding="utf-8")
+    assert "repark_validate_incremental_strategy" in text
+    assert "G3-M2" in text
+    assert "OQ-5" in text
+    assert "insert_overwrite" in text
+    assert "microbatch" in text
+    assert "select distinct" in text.lower()
+    assert "when matched then delete" in text.lower()
+    assert "when not matched" not in text.lower()
+    assert "cannot run as a single SQL string" in text
+    # incremental_predicates plumbing present (not e2e-gated M1a — G3-M2 note in macro).
+    assert "incremental_predicates" in text
+    mat = ROOT / "src/dbt/include/repark/macros/materializations/incremental.sql"
+    mtext = mat.read_text(encoding="utf-8")
+    assert "{% materialization incremental, adapter='repark' %}" in mtext
+    assert "repark_fail_after_delete" in mtext
+    assert "delete+insert" in mtext
 
 
 def test_m1_2_dbt_run_refuses_delete_insert_without_unique_key(tmp_path: Path) -> None:
@@ -325,7 +595,7 @@ def test_m1_2_dbt_run_refuses_delete_insert_without_unique_key(tmp_path: Path) -
         """
     )
     profiles = _write_mini_project(project, model_sql=model)
-    proc = _run_dbt(project, profiles)
+    proc = _run_dbt_subprocess(project, profiles)
     combined = proc.stdout + proc.stderr
     assert proc.returncode != 0, combined
     assert "unique_key" in combined.lower(), combined
@@ -336,12 +606,13 @@ def test_m1_2_dbt_run_refuses_delete_insert_without_unique_key(tmp_path: Path) -
     [
         ("merge", "G3-M2"),
         ("insert_overwrite", "OQ-5"),
-        ("microbatch", "microbatch"),
         ("weird_strategy", "not supported"),
     ],
 )
-def test_m1_2_dbt_run_refuses_unsupported_strategy(tmp_path: Path, strategy: str, needle: str) -> None:
-    project = tmp_path / "proj"
+def test_m1_2_dbt_run_refuses_unsupported_strategy(
+    tmp_path: Path, strategy: str, needle: str
+) -> None:
+    project = tmp_path / f"proj_{strategy}"
     model = textwrap.dedent(
         f"""
         {{{{ config(
@@ -353,46 +624,47 @@ def test_m1_2_dbt_run_refuses_unsupported_strategy(tmp_path: Path, strategy: str
         """
     )
     profiles = _write_mini_project(project, model_sql=model)
-    proc = _run_dbt(project, profiles)
+    proc = _run_dbt_subprocess(project, profiles)
     combined = proc.stdout + proc.stderr
     assert proc.returncode != 0, combined
     assert needle.lower() in combined.lower() or strategy in combined, combined
 
 
-def test_m1_1_dbt_run_incremental_first_run_smoke(tmp_path: Path) -> None:
-    """dbt run smoke: incremental mat registers for append + delete+insert (first run CTAS).
+def test_m1_2_microbatch_refuse_non_vacuous(tmp_path: Path) -> None:
+    """Microbatch with dbt-core required configs; assert adapter's own refuse message."""
+    begin = (date.today() - timedelta(days=1)).isoformat()
+    project = tmp_path / "proj_mb"
+    model = textwrap.dedent(
+        f"""
+        {{{{ config(
+            materialized='incremental',
+            incremental_strategy='microbatch',
+            event_time='ts',
+            batch_size='day',
+            begin='{begin}',
+        ) }}}}
+        select 1 as id, date '{begin}' as ts
+        """
+    )
+    profiles = _write_mini_project(project, model_sql=model, model_name="mb_model")
+    result, msgs = _dbt_invoke(project, profiles)
+    assert not result.success
+    joined = "\n".join(msgs)
+    # Must be the adapter macro refuse — not only dbt-core's missing-config parse error.
+    assert "dbt-repark refuses incremental_strategy='microbatch'" in joined, joined
+    assert "Supported strategies: append, delete+insert" in joined, joined
 
-    Second-run correctness is single-process Arrow strategy plumbing (M1.1 unit tests above).
-    Memory catalog is process-local — subprocess dbt cannot see prior-session tables.
-    """
-    for strategy, name in (("append", "inc_append"), ("delete+insert", "inc_di")):
-        project = tmp_path / f"proj_{name}"
-        model = textwrap.dedent(
-            f"""
-            {{{{ config(
-                materialized='incremental',
-                incremental_strategy='{strategy}',
-                unique_key='id',
-            ) }}}}
-            select 1 as id, 'a' as v
-            """
-        )
-        profiles = _write_mini_project(project, model_sql=model, model_name=name)
-        r1 = _run_dbt(project, profiles)
-        assert r1.returncode == 0, r1.stdout + r1.stderr
+
+# ---------------------------------------------------------------------------
+# NITs — temporary-table refuse restored; rename FQN source pin
+# ---------------------------------------------------------------------------
 
 
-def test_m1_3_fail_after_delete_hook_in_materialization() -> None:
-    """M1.3 hook: materialization raises when repark_fail_after_delete is set (between executes)."""
-    mat = (
-        ROOT / "src/dbt/include/repark/macros/materializations/incremental.sql"
-    ).read_text(encoding="utf-8")
-    assert "repark_fail_after_delete" in mat
-    assert "injected failure after delete" in mat
-    # Residual language must stay honest (§1.5).
-    assert "cannot be rolled back" in mat or "no-op" in mat
-    # Order pin: delete statement before the inject, inject before insert (main).
-    delete_pos = mat.find("statement('delete')")
-    inject_pos = mat.find("repark_fail_after_delete")
-    main_pos = mat.find("statement('main')", inject_pos)
-    assert 0 <= delete_pos < inject_pos < main_pos, (delete_pos, inject_pos, main_pos)
+def test_temporary_table_create_table_as_refuses() -> None:
+    """M0 temporary-table refuse pin: create_table_as(temporary=True) is loud refuse."""
+    text = (ROOT / "src/dbt/include/repark/macros/adapters.sql").read_text(encoding="utf-8")
+    assert "does not support temporary tables" in text
+    assert "temporary" in text
+    # Rename must use fully-qualified to_relation (not bare identifier).
+    assert "rename to {{ to_relation }}" in text
+    assert "to_relation.identifier" not in text
