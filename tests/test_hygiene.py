@@ -21,7 +21,9 @@ def test_no_private_repark_imports() -> None:
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
-                    if alias.name.startswith("repark._") or alias.name.startswith("repark.session._"):
+                    if alias.name.startswith("repark._") or alias.name.startswith(
+                        "repark.session._"
+                    ):
                         offenders.append(f"{path}:{alias.name}")
             elif isinstance(node, ast.ImportFrom):
                 mod = node.module or ""

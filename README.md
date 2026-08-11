@@ -3,7 +3,8 @@
 dbt adapter for the [repark](https://github.com/TRO-Wolf/repark) pure-Rust Iceberg engine
 (**embedded**, no JVM). Adapter type in `profiles.yml`: **`repark`**.
 
-**Status:** M0a skeleton — connect + table materialization + memory unit tests. Not a public release.
+**Status:** M1a — connect + table + incremental (`append`, `delete+insert`) + memory unit tests.
+Not a public release. No AWS gate in this unit (M1b).
 
 ## Install (pre-PyPI)
 
@@ -45,22 +46,51 @@ repark_mem:
 - Do **not** equate engine tier-2 CI OIDC with operator profiles.
 - Manual/AWS acceptance (M0b): scratch/non-prod namespace + warehouse; verify LocationUri binding.
 
-### Transactions
+### Transactions (§1.5 honesty)
 
 Each `execute` is **one** engine `sql()` with **eager** commit. `begin`/`commit`/`rollback` are
 **documented no-ops** — multi-step materializations are **not** atomic. Do not advertise
 “transactional dbt-repark.”
 
-## Materializations (M0)
+**`delete+insert` residual:** that strategy is **two** executes (delete matching keys, then
+insert the batch). If the process fails **after** delete and **before** insert, the residual
+state is real and **cannot be rolled back**: rows whose `unique_key` appeared in the batch are
+already gone; nothing from that batch was inserted. The durable `__dbt_tmp` staging table from
+that run is also left behind (materialization cleanup only runs after a successful path). Unit
+tests pin this (M1.3); ops must re-run or repair manually. Prefer single-statement strategies
+(future `merge` in G3-M2) when atomicity of the upsert matters.
+
+## Materializations (M0–M1a)
 
 | Mat | Behavior |
 |---|---|
 | **table** | `CREATE OR REPLACE TABLE … USING iceberg AS …` (default **recommendation**) |
+| **incremental** | Strategies: **`append`**, **`delete+insert`** only (see below) |
 | **view** | **Loud refuse** — no durable Iceberg VIEW (G3-E2) |
 | **ephemeral** | Stock dbt CTE path |
 
+### Incremental strategies (M1a)
+
+| Strategy | Behavior |
+|---|---|
+| **`append`** (default) | Staging CTAS + `INSERT INTO … SELECT` (one insert execute on incremental runs) |
+| **`delete+insert`** | Staging CTAS + **delete** matching `unique_key` rows + **insert** batch — **two** eager executes; not atomic (see residual above). Requires `unique_key`. |
+| **`merge`** | **Loud refuse** — scheduled **G3-M2** |
+| **`insert_overwrite`** | **Loud refuse** — **OQ-5** (omit M0–M1; later Spark-only optional) |
+| **other / microbatch** | **Loud refuse** — not supported |
+
+`delete+insert` delete half uses Spark-door `MERGE … WHEN MATCHED THEN DELETE` as a
+**delete vehicle only** (engine `DELETE … WHERE key IN (SELECT …)` is incorrect today). That is
+**not** the G3-M2 merge incremental strategy (no combined upsert in one statement).
+
+Staging relations are **durable** Iceberg tables (`__dbt_tmp` suffix); the engine has no
+`TEMP TABLE` / `TEMP VIEW`. Materializations call `create_table_as(False, …)` for staging and
+drop temps after a successful run. **`create_table_as(temporary=True)` is refused loud** (M0
+pin restored) — there is no session-scoped temp table path. Optional `incremental_predicates`
+/`predicates` are plumbed into the delete+insert ON clause but not e2e-gated in M1a (G3-M2).
+
 **Required project config** (dbt core `NodeConfig` still hard-defaults models to `view`;
-this adapter cannot change that core default, so projects **must** set):
+this adapter cannot change that core default, so projects **must** set a non-view default):
 
 ```yaml
 # dbt_project.yml
@@ -69,6 +99,7 @@ models:
 ```
 
 Without that, models resolve to `view` and **fail loud** (refuse-now). See `sample_project/`.
+Incremental models set `+materialized: incremental` (and strategy) on the model or folder.
 
 ## Threat model (year one)
 

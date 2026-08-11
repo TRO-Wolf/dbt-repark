@@ -78,12 +78,13 @@ class ReparkConnectionManager(SQLConnectionManager):
         catalog = credentials.catalog_name
         builder = ReparkSession.builder.appName("dbt-repark")
 
+        catalog_impl = "org.apache.iceberg.spark.SparkCatalog"
         if kind == "memory":
             warehouse = credentials.warehouse or tempfile.mkdtemp(prefix="dbt-repark-wh-")
             Path(warehouse).mkdir(parents=True, exist_ok=True)
             # Config-driven memory catalog registration at getOrCreate.
             builder = (
-                builder.config(f"spark.sql.catalog.{catalog}", "org.apache.iceberg.spark.SparkCatalog")
+                builder.config(f"spark.sql.catalog.{catalog}", catalog_impl)
                 .config(f"spark.sql.catalog.{catalog}.type", "memory")
                 .config(f"spark.sql.catalog.{catalog}.warehouse", str(warehouse))
                 .config("spark.sql.defaultCatalog", catalog)
@@ -91,7 +92,7 @@ class ReparkConnectionManager(SQLConnectionManager):
             session = builder.getOrCreate()
         elif kind == "glue":
             builder = (
-                builder.config(f"spark.sql.catalog.{catalog}", "org.apache.iceberg.spark.SparkCatalog")
+                builder.config(f"spark.sql.catalog.{catalog}", catalog_impl)
                 .config(f"spark.sql.catalog.{catalog}.type", "glue")
                 .config(f"spark.sql.catalog.{catalog}.warehouse", credentials.warehouse)
                 .config("spark.sql.defaultCatalog", catalog)
@@ -103,10 +104,11 @@ class ReparkConnectionManager(SQLConnectionManager):
                 os.environ.setdefault("AWS_PROFILE", credentials.aws_profile_name)
             session = builder.getOrCreate()
         elif kind == "s3tables":
+            arn = credentials.table_bucket_arn
             builder = (
-                builder.config(f"spark.sql.catalog.{catalog}", "org.apache.iceberg.spark.SparkCatalog")
+                builder.config(f"spark.sql.catalog.{catalog}", catalog_impl)
                 .config(f"spark.sql.catalog.{catalog}.type", "s3tables")
-                .config(f"spark.sql.catalog.{catalog}.table_bucket_arn", credentials.table_bucket_arn)
+                .config(f"spark.sql.catalog.{catalog}.table_bucket_arn", arn)
                 .config("spark.sql.defaultCatalog", catalog)
             )
             if credentials.aws_profile_name:
