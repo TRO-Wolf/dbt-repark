@@ -3,8 +3,8 @@
 dbt adapter for the [repark](https://github.com/TRO-Wolf/repark) pure-Rust Iceberg engine
 (**embedded**, no JVM). Adapter type in `profiles.yml`: **`repark`**.
 
-**Status:** M1a — connect + table + incremental (`append`, `delete+insert`) + memory unit tests.
-Not a public release. No AWS gate in this unit (M1b).
+**Status:** M1b — connect + table + incremental (`append`, `delete+insert`,
+`insert_overwrite`) + memory unit tests. Not a public release. No AWS gate in this unit.
 
 ## Install (pre-PyPI)
 
@@ -60,23 +60,38 @@ that run is also left behind (materialization cleanup only runs after a successf
 tests pin this (M1.3); ops must re-run or repair manually. Prefer single-statement strategies
 (future `merge` in G3-M2) when atomicity of the upsert matters.
 
-## Materializations (M0–M1a)
+**`insert_overwrite` residual / composition:** the engine Spark-door `INSERT OVERWRITE` is
+**static whole-table replace** (`overwrite_by_row_filter(AlwaysTrue)`). Hive-style
+`INSERT OVERWRITE … PARTITION (…)` and `partitionOverwriteMode=DYNAMIC` are **not** implemented
+engine-side. This adapter still offers **dbt-spark DYNAMIC semantics** for partitioned models by
+composing a single `INSERT OVERWRITE` whose source is:
+
+`(batch rows) ∪ (existing target rows whose partition keys are absent from the batch)`.
+
+That is one eager execute on the incremental path (atomic for the strategy itself). It is **not**
+engine-native dynamic partition overwrite — kept partitions are re-materialized through the
+overwrite source (cost scales with kept data, not only the batch). Staging is still a durable
+`__dbt_tmp` Iceberg table (engine has no `TEMP TABLE` / `TEMP VIEW`); successful runs drop it.
+**Non-partitioned models refuse loud** (overwrite-all footgun) — use `delete+insert` or
+full-refresh instead; the adapter will not silently whole-table overwrite.
+
+## Materializations (M0–M1b)
 
 | Mat | Behavior |
 |---|---|
-| **table** | `CREATE OR REPLACE TABLE … USING iceberg AS …` (default **recommendation**) |
-| **incremental** | Strategies: **`append`**, **`delete+insert`** only (see below) |
+| **table** | `CREATE OR REPLACE TABLE … USING iceberg AS …` (default **recommendation**); optional `partition_by` → `PARTITIONED BY` |
+| **incremental** | Strategies: **`append`**, **`delete+insert`**, **`insert_overwrite`** (see below) |
 | **view** | **Loud refuse** — no durable Iceberg VIEW (G3-E2) |
 | **ephemeral** | Stock dbt CTE path |
 
-### Incremental strategies (M1a)
+### Incremental strategies (M1b)
 
 | Strategy | Behavior |
 |---|---|
 | **`append`** (default) | Staging CTAS + `INSERT INTO … SELECT` (one insert execute on incremental runs) |
 | **`delete+insert`** | Staging CTAS + **delete** matching `unique_key` rows + **insert** batch — **two** eager executes; not atomic (see residual above). Requires `unique_key`. |
+| **`insert_overwrite`** | Staging CTAS + one Spark-door `INSERT OVERWRITE` composed for **dynamic partition overwrite** (partitions present in the batch replaced; others left alone). Requires `partition_by` (identity column name or list). **Loud refuse** without `partition_by` (no overwrite-whole-table). See composition residual above. |
 | **`merge`** | **Loud refuse** — scheduled **G3-M2** |
-| **`insert_overwrite`** | **Loud refuse** — **OQ-5** (omit M0–M1; later Spark-only optional) |
 | **other / microbatch** | **Loud refuse** — not supported |
 
 `delete+insert` delete half uses Spark-door `MERGE … WHEN MATCHED THEN DELETE` as a
@@ -88,6 +103,11 @@ Staging relations are **durable** Iceberg tables (`__dbt_tmp` suffix); the engin
 drop temps after a successful run. **`create_table_as(temporary=True)` is refused loud** (M0
 pin restored) — there is no session-scoped temp table path. Optional `incremental_predicates`
 /`predicates` are plumbed into the delete+insert ON clause but not e2e-gated in M1a (G3-M2).
+
+**`partition_by`:** identity partition column name or list (e.g. `partition_by='ds'` or
+`partition_by=['region', 'ds']`). Applied on CTAS via Spark-door `PARTITIONED BY (…)` for
+first-run and full-refresh. Transform partitions (`days(ts)`, `bucket(n, col)`, …) are **not**
+accepted as `partition_by` config values in M1b — use identity columns in the model select list.
 
 **Required project config** (dbt core `NodeConfig` still hard-defaults models to `view`;
 this adapter cannot change that core default, so projects **must** set a non-view default):

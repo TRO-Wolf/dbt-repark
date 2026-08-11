@@ -1,9 +1,11 @@
 {% materialization incremental, adapter='repark' %}
   {#
-    G3-M1a: append + delete+insert only.
+    G3-M1a/M1b: append + delete+insert + insert_overwrite (partitioned dynamic).
     delete+insert is two separate executes (not atomic — plan §1.5).
     Failure after delete leaves matching keys removed and nothing inserted.
     Injected failure (repark_fail_after_delete) also leaves the durable __dbt_tmp staging table.
+    insert_overwrite is one INSERT OVERWRITE execute synthesizing dynamic partition overwrite
+    (engine door is static whole-table; see incremental_strategies.sql residual note).
   #}
 
   {%- set existing_relation = load_cached_relation(this) -%}
@@ -14,11 +16,12 @@
   {%- set backup_relation = make_backup_relation(target_relation, backup_relation_type) -%}
 
   {%- set unique_key = config.get('unique_key') -%}
+  {%- set partition_by = config.get('partition_by') -%}
   {%- set full_refresh_mode = (should_full_refresh() or (existing_relation is not none and existing_relation.is_view)) -%}
   {%- set on_schema_change = incremental_validate_on_schema_change(config.get('on_schema_change'), default='ignore') -%}
   {%- set raw_strategy = config.get('incremental_strategy') or 'append' -%}
-  {# Loud refuse unsupported strategies before any SQL (M1.2). #}
-  {% do repark_validate_incremental_strategy(raw_strategy) %}
+  {# Loud refuse unsupported strategies / insert_overwrite without partition_by before any SQL. #}
+  {% do repark_validate_incremental_strategy(raw_strategy, partition_by) %}
   {# Normalize default → append after validation. #}
   {%- set incremental_strategy = 'append'
         if (raw_strategy | trim | lower) in ['append', 'default']
@@ -96,9 +99,16 @@
       {% call statement('main') -%}
         {{ repark_get_incremental_insert_sql(target_relation, temp_relation, dest_columns) }}
       {%- endcall %}
+    {% elif incremental_strategy == 'insert_overwrite' %}
+      {# partition_by validated above; one INSERT OVERWRITE (dynamic composition). #}
+      {% call statement('main') -%}
+        {{ repark_get_incremental_insert_overwrite_sql(
+              target_relation, temp_relation, dest_columns, partition_by
+          ) }}
+      {%- endcall %}
     {% else %}
       {# Should be unreachable after repark_validate_incremental_strategy. #}
-      {% do repark_validate_incremental_strategy(incremental_strategy) %}
+      {% do repark_validate_incremental_strategy(incremental_strategy, partition_by) %}
     {% endif %}
   {% endif %}
 

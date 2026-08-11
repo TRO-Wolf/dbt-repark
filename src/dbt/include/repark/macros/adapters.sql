@@ -15,7 +15,8 @@
 {% macro repark__create_table_as(temporary, relation, sql) -%}
   {# Engine has no TEMP TABLE / TEMP VIEW. Staging uses durable Iceberg tables with a
      dbt temp/intermediate suffix and temporary=False (materializations drop them).
-     temporary=True remains a loud refuse (M0 pin) — not a silent TEMP TABLE. #}
+     temporary=True remains a loud refuse (M0 pin) — not a silent TEMP TABLE.
+     Optional config partition_by → Spark-door PARTITIONED BY (identity columns). #}
   {%- if temporary -%}
     {{ exceptions.raise_compiler_error(
       "dbt-repark does not support temporary tables (engine has no TEMP TABLE / TEMP VIEW). "
@@ -25,6 +26,7 @@
   {%- endif -%}
   create or replace table {{ relation }}
   using iceberg
+  {{ repark_partitioned_by_clause() }}
   as
   {{ sql }}
 {%- endmacro %}

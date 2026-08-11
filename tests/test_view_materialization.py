@@ -104,6 +104,6 @@ def test_dbt_compile_view_model_fails(tmp_path: Path) -> None:
     assert proc.returncode != 0, combined
     lower = combined.lower()
     assert "view" in lower, combined
-    assert (
-        "durable" in lower or "g3-e2" in lower or "refuse" in lower or "iceberg view" in lower
-    ), combined
+    assert "durable" in lower or "g3-e2" in lower or "refuse" in lower or "iceberg view" in lower, (
+        combined
+    )
