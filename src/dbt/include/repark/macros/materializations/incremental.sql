@@ -1,11 +1,12 @@
 {% materialization incremental, adapter='repark' %}
   {#
-    G3-M1a/M1b: append + delete+insert + insert_overwrite (partitioned dynamic).
+    G3-M1a/M1b/M2a: append + delete+insert + insert_overwrite (partitioned dynamic) + merge.
     delete+insert is two separate executes (not atomic — plan §1.5).
     Failure after delete leaves matching keys removed and nothing inserted.
     Injected failure (repark_fail_after_delete) also leaves the durable __dbt_tmp staging table.
     insert_overwrite is one INSERT OVERWRITE execute synthesizing dynamic partition overwrite
     (engine door is static whole-table; see incremental_strategies.sql residual note).
+    merge is one MERGE INTO execute (upsert) — preferred when atomicity of the upsert matters.
   #}
 
   {%- set existing_relation = load_cached_relation(this) -%}
@@ -20,17 +21,19 @@
   {%- set full_refresh_mode = (should_full_refresh() or (existing_relation is not none and existing_relation.is_view)) -%}
   {%- set on_schema_change = incremental_validate_on_schema_change(config.get('on_schema_change'), default='ignore') -%}
   {%- set raw_strategy = config.get('incremental_strategy') or 'append' -%}
-  {# Loud refuse unsupported strategies / insert_overwrite without partition_by before any SQL. #}
+  {# Loud refuse unsupported strategies / insert_overwrite without partition_by before any SQL (M1.2 / M2.2). #}
   {% do repark_validate_incremental_strategy(raw_strategy, partition_by) %}
   {# Normalize default → append after validation. #}
   {%- set incremental_strategy = 'append'
         if (raw_strategy | trim | lower) in ['append', 'default']
         else (raw_strategy | trim | lower) -%}
-  {# Fail loud before staging work when delete+insert lacks unique_key. #}
-  {% if incremental_strategy == 'delete+insert' and not unique_key %}
+  {# Fail loud before staging when keyed strategies lack unique_key. #}
+  {% if incremental_strategy in ['delete+insert', 'merge'] and not unique_key %}
     {% do exceptions.raise_compiler_error(
-      "dbt-repark incremental strategy 'delete+insert' requires config unique_key "
-      "(one column name or list of column names)."
+      "dbt-repark incremental strategy '" ~ incremental_strategy ~ "' requires config unique_key "
+      "(one column name or list of column names). "
+      "For merge, unique_key is the MERGE ON match key (upsert contract); without it this "
+      "adapter refuses rather than emitting an insert-only ON FALSE merge."
     ) %}
   {% endif %}
 
@@ -104,6 +107,13 @@
       {% call statement('main') -%}
         {{ repark_get_incremental_insert_overwrite_sql(
               target_relation, temp_relation, dest_columns, partition_by
+          ) }}
+      {%- endcall %}
+    {% elif incremental_strategy == 'merge' %}
+      {# unique_key validated above; one MERGE INTO upsert (N-2/N-2b engine semantics). #}
+      {% call statement('main') -%}
+        {{ repark_get_incremental_merge_sql(
+              target_relation, temp_relation, unique_key, dest_columns, incremental_predicates
           ) }}
       {%- endcall %}
     {% else %}

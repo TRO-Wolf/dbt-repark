@@ -1,7 +1,8 @@
 {#
-  Incremental strategy helpers for dbt-repark (G3-M1a + G3-M1b).
-  Supported: append, delete+insert, insert_overwrite (partitioned, dynamic semantics).
-  Unsupported (loud refuse): merge (G3-M2), microbatch/other.
+  Incremental strategy helpers for dbt-repark (G3-M1a + G3-M1b + G3-M2a).
+  Supported: append, delete+insert, insert_overwrite (partitioned, dynamic semantics),
+  merge (Spark-door MERGE INTO upsert, one eager execute).
+  Unsupported (loud refuse): microbatch/other.
 #}
 
 {% macro repark_normalize_partition_by(partition_by) -%}
@@ -68,21 +69,16 @@
       ) %}
     {%- endif -%}
   {%- elif s == 'merge' -%}
-    {% do exceptions.raise_compiler_error(
-      "dbt-repark refuses incremental_strategy='merge' in G3-M1a/M1b. "
-      "MERGE INTO upsert is scheduled for G3-M2 (not M1). "
-      "Use incremental_strategy='append', 'delete+insert', or 'insert_overwrite'."
-    ) %}
+    {# ok — G3-M2a MERGE INTO upsert (one eager execute) #}
   {%- elif s == 'microbatch' -%}
     {% do exceptions.raise_compiler_error(
       "dbt-repark refuses incremental_strategy='microbatch': not supported. "
-      "Supported strategies: append, delete+insert, insert_overwrite."
+      "Supported strategies: append, delete+insert, insert_overwrite, merge."
     ) %}
   {%- else -%}
     {% do exceptions.raise_compiler_error(
       "dbt-repark refuses incremental_strategy='" ~ strategy ~ "': not supported. "
-      "Supported strategies: append, delete+insert, insert_overwrite. "
-      "(merge → G3-M2.)"
+      "Supported strategies: append, delete+insert, insert_overwrite, merge."
     ) %}
   {%- endif -%}
 {%- endmacro %}
@@ -148,15 +144,14 @@
 
     Engine note: DELETE … WHERE key IN (SELECT …) currently removes *all* rows on repark
     (incorrect). We therefore use MERGE … WHEN MATCHED THEN DELETE as a single-predicate
-    *delete vehicle* only — this is NOT the G3-M2 merge incremental strategy
+    *delete vehicle* only — this is NOT the G3-M2a merge incremental strategy
     (delete-only MERGE; insert is a separate execute, not combined upsert).
 
     Source side is SELECT DISTINCT on unique_key columns so duplicate batch keys do not
     trip MERGE_CARDINALITY_VIOLATION.
 
     incremental_predicates / predicates: optional extra ON-clause fragments plumbed through
-    (same shape as stock dbt delete+insert). Accepted and appended here; no dedicated e2e
-    pin in M1a — exercise or gate further in G3-M2 if productized.
+    (same shape as stock dbt delete+insert).
   #}
   {%- if unique_key is string -%}
     {%- set unique_key_list = [unique_key] -%}
@@ -189,6 +184,66 @@
   ) as DBT_INTERNAL_SOURCE
   on {{ predicates | join(' and ') }}
   when matched then delete
+{%- endmacro %}
+
+
+{% macro repark_get_incremental_merge_sql(
+      target_relation, temp_relation, unique_key, dest_columns, incremental_predicates=none
+) -%}
+  {#
+    G3-M2a: real merge incremental strategy — one Spark-door MERGE INTO upsert.
+
+    Semantics (engine-pinned; N-2 / N-2b corpora — cite, do not re-pin here):
+      - WHEN MATCHED THEN UPDATE + WHEN NOT MATCHED THEN INSERT
+      - Duplicate source keys that match a target row → MERGE_CARDINALITY_VIOLATION
+        (engine refuses; surfaces unchanged to dbt users)
+      - Duplicate source keys that only insert (no target match) commit both rows
+      - NULL unique_key values do not match (Spark NULL=NULL is unknown)
+
+    Requires unique_key (validated in the materialization before staging). Without a key
+    the stock dbt default would emit ON FALSE (insert-only) — this adapter refuses that
+    footgun loud so merge always means keyed upsert.
+
+    Optional extras (M2.2 residual — off / not productized this unit):
+      merge_update_columns, merge_exclude_columns, merge_with_schema_evolution,
+      when-matched-delete-only variants, NOT MATCHED BY SOURCE. Predicates are plumbed.
+  #}
+  {%- if unique_key is string -%}
+    {%- set unique_key_list = [unique_key] -%}
+  {%- else -%}
+    {%- set unique_key_list = unique_key -%}
+  {%- endif -%}
+
+  {%- set predicates = [] -%}
+  {%- for key in unique_key_list -%}
+    {%- do predicates.append(
+          'DBT_INTERNAL_DEST.' ~ adapter.quote(key) ~ ' = DBT_INTERNAL_SOURCE.' ~ adapter.quote(key)
+        ) -%}
+  {%- endfor -%}
+  {%- if incremental_predicates -%}
+    {%- for predicate in incremental_predicates -%}
+      {%- do predicates.append(predicate) -%}
+    {%- endfor -%}
+  {%- endif -%}
+
+  {%- set dest_cols_csv = get_quoted_csv(dest_columns | map(attribute='name')) -%}
+  {%- set update_set = [] -%}
+  {%- set insert_vals = [] -%}
+  {%- for col in dest_columns -%}
+    {%- set q = adapter.quote(col.name) -%}
+    {%- do update_set.append(q ~ ' = DBT_INTERNAL_SOURCE.' ~ q) -%}
+    {%- do insert_vals.append('DBT_INTERNAL_SOURCE.' ~ q) -%}
+  {%- endfor -%}
+
+  merge into {{ target_relation }} as DBT_INTERNAL_DEST
+  using {{ temp_relation }} as DBT_INTERNAL_SOURCE
+  on {{ predicates | join(' and ') }}
+  when matched then update set
+    {{ update_set | join(',\n    ') }}
+  when not matched then insert
+    ({{ dest_cols_csv }})
+  values
+    ({{ insert_vals | join(', ') }})
 {%- endmacro %}
 
 
@@ -225,5 +280,12 @@
       arg_dict["temp_relation"],
       arg_dict["dest_columns"],
       arg_dict.get("partition_by", config.get("partition_by"))
+  )) %}
+{% endmacro %}
+
+
+{% macro repark__get_merge_sql(target, source, unique_key, dest_columns, incremental_predicates=none) %}
+  {% do return(repark_get_incremental_merge_sql(
+      target, source, unique_key, dest_columns, incremental_predicates
   )) %}
 {% endmacro %}

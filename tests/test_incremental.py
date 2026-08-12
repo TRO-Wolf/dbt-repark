@@ -1,4 +1,4 @@
-"""G3-M1a/M1b: append + delete+insert + insert_overwrite materialization tests (memory)."""
+"""G3-M1a/M1b/M2a: append + delete+insert + insert_overwrite + merge materialization tests."""
 
 from __future__ import annotations
 
@@ -220,7 +220,7 @@ def _dbt_invoke(
 def test_valid_incremental_strategies_pin() -> None:
     # Unbound call — method does not use instance state (discovery surface only).
     strategies = ReparkAdapter.valid_incremental_strategies(None)  # type: ignore[arg-type]
-    assert strategies == ["append", "delete+insert", "insert_overwrite"]
+    assert strategies == ["append", "delete+insert", "insert_overwrite", "merge"]
     doc = ReparkAdapter.valid_incremental_strategies.__doc__ or ""
     assert "Dead-surface" in doc or "sole strategy gate" in doc
 
@@ -810,11 +810,11 @@ def test_m1_3_fail_after_delete_hook_order_pin() -> None:
 
 
 def test_m1_2_strategy_macros_source_pins() -> None:
-    """Macro source pins for loud refuse messages + delete vehicle + insert_overwrite."""
+    """Macro source pins for loud refuse messages + delete vehicle + insert_overwrite + merge."""
     path = ROOT / "src/dbt/include/repark/macros/materializations/incremental_strategies.sql"
     text = path.read_text(encoding="utf-8")
     assert "repark_validate_incremental_strategy" in text
-    assert "G3-M2" in text
+    assert "G3-M2a" in text
     assert "insert_overwrite" in text
     assert "repark_get_incremental_insert_overwrite_sql" in text
     assert "insert overwrite" in text.lower()
@@ -823,12 +823,16 @@ def test_m1_2_strategy_macros_source_pins() -> None:
     assert "microbatch" in text
     assert "select distinct" in text.lower()
     assert "when matched then delete" in text.lower()
-    assert "when not matched" not in text.lower()
     assert "cannot run as a single SQL string" in text
-    # incremental_predicates plumbing present (not e2e-gated M1a — G3-M2 note in macro).
     assert "incremental_predicates" in text
     # Dynamic composition residual documented (engine static OW).
     assert "static whole-table" in text.lower() or "dynamic partition" in text.lower()
+    # G3-M2a merge strategy emits full upsert (not delete-only vehicle).
+    assert "repark_get_incremental_merge_sql" in text
+    assert "when matched then update set" in text.lower()
+    assert "when not matched then insert" in text.lower()
+    assert "MERGE_CARDINALITY_VIOLATION" in text
+    assert "N-2" in text or "N-2b" in text
     mat = ROOT / "src/dbt/include/repark/macros/materializations/incremental.sql"
     mtext = mat.read_text(encoding="utf-8")
     assert "{% materialization incremental, adapter='repark' %}" in mtext
@@ -837,6 +841,7 @@ def test_m1_2_strategy_macros_source_pins() -> None:
     assert "insert_overwrite" in mtext
     adapters = (ROOT / "src/dbt/include/repark/macros/adapters.sql").read_text(encoding="utf-8")
     assert "repark_partitioned_by_clause" in adapters
+    assert "incremental_strategy == 'merge'" in mtext or "repark_get_incremental_merge_sql" in mtext
 
 
 def test_m1_2_dbt_run_refuses_delete_insert_without_unique_key(tmp_path: Path) -> None:
@@ -860,7 +865,6 @@ def test_m1_2_dbt_run_refuses_delete_insert_without_unique_key(tmp_path: Path) -
 @pytest.mark.parametrize(
     ("strategy", "needle"),
     [
-        ("merge", "G3-M2"),
         ("weird_strategy", "not supported"),
     ],
 )
@@ -907,7 +911,323 @@ def test_m1_2_microbatch_refuse_non_vacuous(tmp_path: Path) -> None:
     joined = "\n".join(msgs)
     # Must be the adapter macro refuse — not only dbt-core's missing-config parse error.
     assert "dbt-repark refuses incremental_strategy='microbatch'" in joined, joined
-    assert "Supported strategies: append, delete+insert, insert_overwrite" in joined, joined
+    assert "Supported strategies: append, delete+insert, insert_overwrite, merge" in joined, joined
+
+
+# ---------------------------------------------------------------------------
+# M2.1 — merge incremental (one MERGE INTO upsert; memory; Arrow checks)
+# ---------------------------------------------------------------------------
+
+
+def test_m2_1_merge_update_only_dbt_runner(tmp_path: Path) -> None:
+    """Merge second batch updates existing keys only; non-batch keys intact."""
+    project = tmp_path / "proj_merge_uo"
+    model = textwrap.dedent(
+        """
+        {{ config(
+            materialized='incremental',
+            incremental_strategy='merge',
+            unique_key='id',
+        ) }}
+        select 1 as id, 'keep' as v
+        union all
+        select 2 as id, 'old' as v
+        """
+    )
+    profiles = _write_mini_project(project, model_sql=model, model_name="inc_merge_uo")
+
+    with _shared_memory_session() as shared:
+        r1, _ = _dbt_invoke(project, profiles)
+        assert r1.success, r1.exception
+
+        (project / "models" / "inc_merge_uo.sql").write_text(
+            textwrap.dedent(
+                """
+                {{ config(
+                    materialized='incremental',
+                    incremental_strategy='merge',
+                    unique_key='id',
+                ) }}
+                select 2 as id, 'new' as v
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        r2, _ = _dbt_invoke(project, profiles)
+        assert r2.success, r2.exception
+
+        session = next(iter(shared.values()))
+        out = _session_rows(
+            session,
+            "select id, v from spark_catalog.default.inc_merge_uo order by id",
+        )
+        assert out == [(1, "keep"), (2, "new")], out
+        names = _session_table_names(session)
+        assert "inc_merge_uo" in names
+        assert not any(n.endswith("__dbt_tmp") for n in names), names
+
+
+def test_m2_1_merge_insert_only_dbt_runner(tmp_path: Path) -> None:
+    """Merge second batch inserts only new keys; prior rows unchanged."""
+    project = tmp_path / "proj_merge_io"
+    model = textwrap.dedent(
+        """
+        {{ config(
+            materialized='incremental',
+            incremental_strategy='merge',
+            unique_key='id',
+        ) }}
+        select 1 as id, 'a' as v
+        """
+    )
+    profiles = _write_mini_project(project, model_sql=model, model_name="inc_merge_io")
+
+    with _shared_memory_session() as shared:
+        r1, _ = _dbt_invoke(project, profiles)
+        assert r1.success, r1.exception
+
+        (project / "models" / "inc_merge_io.sql").write_text(
+            textwrap.dedent(
+                """
+                {{ config(
+                    materialized='incremental',
+                    incremental_strategy='merge',
+                    unique_key='id',
+                ) }}
+                select 2 as id, 'b' as v
+                union all
+                select 3 as id, 'c' as v
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        r2, _ = _dbt_invoke(project, profiles)
+        assert r2.success, r2.exception
+
+        session = next(iter(shared.values()))
+        out = _session_rows(
+            session,
+            "select id, v from spark_catalog.default.inc_merge_io order by id",
+        )
+        assert out == [(1, "a"), (2, "b"), (3, "c")], out
+
+
+def test_m2_1_merge_mixed_dbt_runner(tmp_path: Path) -> None:
+    """Merge mixed batch: update + insert in one MERGE INTO execute."""
+    project = tmp_path / "proj_merge_mx"
+    model = textwrap.dedent(
+        """
+        {{ config(
+            materialized='incremental',
+            incremental_strategy='merge',
+            unique_key='id',
+        ) }}
+        select 1 as id, 'keep' as v
+        union all
+        select 2 as id, 'old' as v
+        """
+    )
+    profiles = _write_mini_project(project, model_sql=model, model_name="inc_merge_mx")
+
+    with _shared_memory_session() as shared:
+        r1, _ = _dbt_invoke(project, profiles)
+        assert r1.success, r1.exception
+
+        (project / "models" / "inc_merge_mx.sql").write_text(
+            textwrap.dedent(
+                """
+                {{ config(
+                    materialized='incremental',
+                    incremental_strategy='merge',
+                    unique_key='id',
+                ) }}
+                select 2 as id, 'new' as v
+                union all
+                select 3 as id, 'added' as v
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        r2, _ = _dbt_invoke(project, profiles)
+        assert r2.success, r2.exception
+
+        session = next(iter(shared.values()))
+        out = _session_rows(
+            session,
+            "select id, v from spark_catalog.default.inc_merge_mx order by id",
+        )
+        assert out == [(1, "keep"), (2, "new"), (3, "added")], out
+
+
+def test_m2_1_merge_multi_key_dbt_runner(tmp_path: Path) -> None:
+    """Composite unique_key merge through the real materialization."""
+    project = tmp_path / "proj_merge_mk"
+    model = textwrap.dedent(
+        """
+        {{ config(
+            materialized='incremental',
+            incremental_strategy='merge',
+            unique_key=['a', 'b'],
+        ) }}
+        select 1 as a, 'x' as b, 10 as v
+        union all
+        select 2 as a, 'y' as b, 20 as v
+        """
+    )
+    profiles = _write_mini_project(project, model_sql=model, model_name="inc_merge_mk")
+
+    with _shared_memory_session() as shared:
+        r1, _ = _dbt_invoke(project, profiles)
+        assert r1.success, r1.exception
+
+        (project / "models" / "inc_merge_mk.sql").write_text(
+            textwrap.dedent(
+                """
+                {{ config(
+                    materialized='incremental',
+                    incremental_strategy='merge',
+                    unique_key=['a', 'b'],
+                ) }}
+                select 1 as a, 'x' as b, 11 as v
+                union all
+                select 3 as a, 'z' as b, 30 as v
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        r2, _ = _dbt_invoke(project, profiles)
+        assert r2.success, r2.exception
+
+        session = next(iter(shared.values()))
+        out = _session_rows(
+            session,
+            "select a, b, v from spark_catalog.default.inc_merge_mk order by a",
+        )
+        assert out == [(1, "x", 11), (2, "y", 20), (3, "z", 30)], out
+
+
+def test_m2_1_merge_duplicate_source_key_matched_raises(tmp_path: Path) -> None:
+    """Duplicate batch keys matching a target row surface MERGE_CARDINALITY_VIOLATION.
+
+    Engine N-2/N-2b pin: both repark and Spark refuse; adapter must not swallow/rewrite.
+    """
+    project = tmp_path / "proj_merge_dup"
+    model = textwrap.dedent(
+        """
+        {{ config(
+            materialized='incremental',
+            incremental_strategy='merge',
+            unique_key='id',
+        ) }}
+        select 1 as id, 'a' as v
+        union all
+        select 2 as id, 'old' as v
+        """
+    )
+    profiles = _write_mini_project(project, model_sql=model, model_name="inc_merge_dup")
+
+    with _shared_memory_session() as shared:
+        r1, _ = _dbt_invoke(project, profiles)
+        assert r1.success, r1.exception
+
+        (project / "models" / "inc_merge_dup.sql").write_text(
+            textwrap.dedent(
+                """
+                {{ config(
+                    materialized='incremental',
+                    incremental_strategy='merge',
+                    unique_key='id',
+                ) }}
+                select 2 as id, 'n1' as v
+                union all
+                select 2 as id, 'n2' as v
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        r2, msgs = _dbt_invoke(project, profiles)
+        assert not r2.success, "expected MERGE_CARDINALITY_VIOLATION on duplicate matched keys"
+        joined = "\n".join(msgs) + "\n" + str(r2.exception or "")
+        assert "MERGE_CARDINALITY_VIOLATION" in joined, joined
+
+        # Target residual: first-run rows unchanged (failed merge must not partial-apply).
+        session = next(iter(shared.values()))
+        residual = _session_rows(
+            session,
+            "select id, v from spark_catalog.default.inc_merge_dup order by id",
+        )
+        assert residual == [(1, "a"), (2, "old")], residual
+
+
+def test_m2_1_merge_refuses_without_unique_key(tmp_path: Path) -> None:
+    """merge without unique_key is a loud refuse (no ON FALSE insert-only footgun)."""
+    project = tmp_path / "proj_merge_uk"
+    model = textwrap.dedent(
+        """
+        {{ config(
+            materialized='incremental',
+            incremental_strategy='merge',
+        ) }}
+        select 1 as id, 'x' as v
+        """
+    )
+    profiles = _write_mini_project(project, model_sql=model, model_name="inc_merge_uk")
+    result, msgs = _dbt_invoke(project, profiles)
+    assert not result.success
+    joined = "\n".join(msgs)
+    assert "unique_key" in joined.lower(), joined
+    assert "merge" in joined.lower(), joined
+    # Actionable: points at upsert contract / refuses insert-only ON FALSE.
+    assert "ON FALSE" in joined or "upsert" in joined.lower() or "column name" in joined, joined
+
+
+def test_m2_1_merge_full_refresh(tmp_path: Path) -> None:
+    """Full-refresh replaces the merge model table (CTAS + rename path)."""
+    project = tmp_path / "proj_merge_fr"
+    model = textwrap.dedent(
+        """
+        {{ config(
+            materialized='incremental',
+            incremental_strategy='merge',
+            unique_key='id',
+        ) }}
+        select 1 as id, 'a' as v
+        """
+    )
+    profiles = _write_mini_project(project, model_sql=model, model_name="inc_merge_fr")
+
+    with _shared_memory_session() as shared:
+        r1, _ = _dbt_invoke(project, profiles)
+        assert r1.success, r1.exception
+
+        (project / "models" / "inc_merge_fr.sql").write_text(
+            textwrap.dedent(
+                """
+                {{ config(
+                    materialized='incremental',
+                    incremental_strategy='merge',
+                    unique_key='id',
+                ) }}
+                select 9 as id, 'full' as v
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        r2, _ = _dbt_invoke(project, profiles, "--full-refresh")
+        assert r2.success, r2.exception
+
+        session = next(iter(shared.values()))
+        out = _session_rows(
+            session,
+            "select id, v from spark_catalog.default.inc_merge_fr order by id",
+        )
+        assert out == [(9, "full")], out
 
 
 # ---------------------------------------------------------------------------
