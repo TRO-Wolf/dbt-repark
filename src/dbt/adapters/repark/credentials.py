@@ -122,9 +122,7 @@ class ReparkCredentials(Credentials):
             # Allow empty warehouse — connection open will create a temp dir.
             pass
         if kind == "glue" and not self.warehouse:
-            raise FailedToConnectError(
-                "dbt-repark catalog_type=glue requires warehouse (s3://…)."
-            )
+            raise FailedToConnectError("dbt-repark catalog_type=glue requires warehouse (s3://…).")
         if kind == "s3tables" and not self.table_bucket_arn:
             raise FailedToConnectError(
                 "dbt-repark catalog_type=s3tables requires table_bucket_arn."

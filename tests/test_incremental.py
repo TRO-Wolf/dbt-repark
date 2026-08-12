@@ -1,4 +1,4 @@
-"""G3-M1a: real append + delete+insert materialization tests (memory; no persist claim)."""
+"""G3-M1a/M1b: append + delete+insert + insert_overwrite materialization tests (memory)."""
 
 from __future__ import annotations
 
@@ -220,7 +220,7 @@ def _dbt_invoke(
 def test_valid_incremental_strategies_pin() -> None:
     # Unbound call — method does not use instance state (discovery surface only).
     strategies = ReparkAdapter.valid_incremental_strategies(None)  # type: ignore[arg-type]
-    assert strategies == ["append", "delete+insert"]
+    assert strategies == ["append", "delete+insert", "insert_overwrite"]
     doc = ReparkAdapter.valid_incremental_strategies.__doc__ or ""
     assert "Dead-surface" in doc or "sole strategy gate" in doc
 
@@ -468,6 +468,254 @@ def test_m1_1_full_refresh_rename_fqn(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# M1b — insert_overwrite (dynamic partition overwrite via Spark-door)
+# ---------------------------------------------------------------------------
+
+
+def test_m1b_insert_overwrite_single_partition_untouched(tmp_path: Path) -> None:
+    """Second batch overwrites exactly its partition; other partitions intact (Arrow)."""
+    project = tmp_path / "proj_io_single"
+    model = textwrap.dedent(
+        """
+        {{ config(
+            materialized='incremental',
+            incremental_strategy='insert_overwrite',
+            partition_by='p',
+        ) }}
+        select 1 as id, 'a' as p, 'keep_a' as v
+        union all
+        select 2 as id, 'b' as p, 'old_b' as v
+        union all
+        select 3 as id, 'c' as p, 'keep_c' as v
+        """
+    )
+    profiles = _write_mini_project(project, model_sql=model, model_name="inc_io")
+
+    with _shared_memory_session() as shared:
+        r1, _ = _dbt_invoke(project, profiles)
+        assert r1.success, r1.exception
+
+        (project / "models" / "inc_io.sql").write_text(
+            textwrap.dedent(
+                """
+                {{ config(
+                    materialized='incremental',
+                    incremental_strategy='insert_overwrite',
+                    partition_by='p',
+                ) }}
+                select 20 as id, 'b' as p, 'new_b1' as v
+                union all
+                select 21 as id, 'b' as p, 'new_b2' as v
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        r2, _ = _dbt_invoke(project, profiles)
+        assert r2.success, r2.exception
+
+        session = next(iter(shared.values()))
+        out = _session_rows(
+            session,
+            "select id, p, v from spark_catalog.default.inc_io order by id",
+        )
+        assert out == [
+            (1, "a", "keep_a"),
+            (3, "c", "keep_c"),
+            (20, "b", "new_b1"),
+            (21, "b", "new_b2"),
+        ], out
+        # Old partition-b row gone; a and c untouched.
+        ids = {r[0] for r in out}
+        assert 2 not in ids
+        names = _session_table_names(session)
+        assert "inc_io" in names
+        assert not any(n.endswith("__dbt_tmp") for n in names), names
+
+
+def test_m1b_insert_overwrite_multi_partition_batch(tmp_path: Path) -> None:
+    """Multi-partition batch overwrites only those partitions; others intact."""
+    project = tmp_path / "proj_io_multi"
+    model = textwrap.dedent(
+        """
+        {{ config(
+            materialized='incremental',
+            incremental_strategy='insert_overwrite',
+            partition_by='p',
+        ) }}
+        select 1 as id, 'a' as p, 'old_a' as v
+        union all
+        select 2 as id, 'b' as p, 'keep_b' as v
+        union all
+        select 3 as id, 'c' as p, 'old_c' as v
+        """
+    )
+    profiles = _write_mini_project(project, model_sql=model, model_name="inc_io_m")
+
+    with _shared_memory_session() as shared:
+        r1, _ = _dbt_invoke(project, profiles)
+        assert r1.success, r1.exception
+
+        (project / "models" / "inc_io_m.sql").write_text(
+            textwrap.dedent(
+                """
+                {{ config(
+                    materialized='incremental',
+                    incremental_strategy='insert_overwrite',
+                    partition_by='p',
+                ) }}
+                select 10 as id, 'a' as p, 'new_a' as v
+                union all
+                select 30 as id, 'c' as p, 'new_c' as v
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        r2, _ = _dbt_invoke(project, profiles)
+        assert r2.success, r2.exception
+
+        session = next(iter(shared.values()))
+        out = _session_rows(
+            session,
+            "select id, p, v from spark_catalog.default.inc_io_m order by id",
+        )
+        assert out == [
+            (2, "b", "keep_b"),
+            (10, "a", "new_a"),
+            (30, "c", "new_c"),
+        ], out
+
+
+def test_m1b_insert_overwrite_composite_partition_by(tmp_path: Path) -> None:
+    """Composite partition_by=['p','q'] dynamic overwrite through real mat."""
+    project = tmp_path / "proj_io_comp"
+    model = textwrap.dedent(
+        """
+        {{ config(
+            materialized='incremental',
+            incremental_strategy='insert_overwrite',
+            partition_by=['p', 'q'],
+        ) }}
+        select 1 as id, 'a' as p, 1 as q, 'keep' as v
+        union all
+        select 2 as id, 'a' as p, 2 as q, 'old' as v
+        union all
+        select 3 as id, 'b' as p, 1 as q, 'keep_b' as v
+        """
+    )
+    profiles = _write_mini_project(project, model_sql=model, model_name="inc_io_c")
+
+    with _shared_memory_session() as shared:
+        r1, _ = _dbt_invoke(project, profiles)
+        assert r1.success, r1.exception
+
+        (project / "models" / "inc_io_c.sql").write_text(
+            textwrap.dedent(
+                """
+                {{ config(
+                    materialized='incremental',
+                    incremental_strategy='insert_overwrite',
+                    partition_by=['p', 'q'],
+                ) }}
+                select 20 as id, 'a' as p, 2 as q, 'new' as v
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        r2, _ = _dbt_invoke(project, profiles)
+        assert r2.success, r2.exception
+
+        session = next(iter(shared.values()))
+        out = _session_rows(
+            session,
+            "select id, p, q, v from spark_catalog.default.inc_io_c order by id",
+        )
+        assert out == [
+            (1, "a", 1, "keep"),
+            (3, "b", 1, "keep_b"),
+            (20, "a", 2, "new"),
+        ], out
+
+
+def test_m1b_insert_overwrite_full_refresh(tmp_path: Path) -> None:
+    """Full-refresh replaces the whole partitioned table (CTAS + rename path)."""
+    project = tmp_path / "proj_io_fr"
+    model = textwrap.dedent(
+        """
+        {{ config(
+            materialized='incremental',
+            incremental_strategy='insert_overwrite',
+            partition_by='p',
+        ) }}
+        select 1 as id, 'a' as p, 'old' as v
+        union all
+        select 2 as id, 'b' as p, 'old' as v
+        """
+    )
+    profiles = _write_mini_project(project, model_sql=model, model_name="inc_io_fr")
+
+    with _shared_memory_session() as shared:
+        r1, _ = _dbt_invoke(project, profiles)
+        assert r1.success, r1.exception
+
+        (project / "models" / "inc_io_fr.sql").write_text(
+            textwrap.dedent(
+                """
+                {{ config(
+                    materialized='incremental',
+                    incremental_strategy='insert_overwrite',
+                    partition_by='p',
+                ) }}
+                select 9 as id, 'z' as p, 'full' as v
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        r2, _ = _dbt_invoke(project, profiles, "--full-refresh")
+        assert r2.success, r2.exception
+
+        session = next(iter(shared.values()))
+        out = _session_rows(
+            session,
+            "select id, p, v from spark_catalog.default.inc_io_fr order by id",
+        )
+        assert out == [(9, "z", "full")], out
+        names = _session_table_names(session)
+        assert "inc_io_fr" in names
+        assert not any("__dbt_tmp" in n or "__dbt_backup" in n for n in names), names
+
+
+def test_m1b_insert_overwrite_refuses_without_partition_by(tmp_path: Path) -> None:
+    """Non-partitioned insert_overwrite is a loud refuse (overwrite-all footgun / A10)."""
+    project = tmp_path / "proj_io_refuse"
+    model = textwrap.dedent(
+        """
+        {{ config(
+            materialized='incremental',
+            incremental_strategy='insert_overwrite',
+        ) }}
+        select 1 as id, 'x' as v
+        """
+    )
+    profiles = _write_mini_project(project, model_sql=model, model_name="inc_io_np")
+    result, msgs = _dbt_invoke(project, profiles)
+    assert not result.success
+    joined = "\n".join(msgs)
+    assert "insert_overwrite" in joined.lower(), joined
+    assert "partition_by" in joined.lower(), joined
+    # Guidance toward alternatives (charter refuse-loud fence).
+    assert "delete+insert" in joined.lower() or "full-refresh" in joined.lower(), joined
+    assert (
+        "footgun" in joined.lower()
+        or "overwrite-all" in joined.lower()
+        or ("whole-table" in joined.lower())
+    ), joined
+
+
+# ---------------------------------------------------------------------------
 # M1.3 — executed failure injection + residual assertion
 # ---------------------------------------------------------------------------
 
@@ -540,9 +788,9 @@ def test_m1_3_fail_after_delete_run_residual(tmp_path: Path) -> None:
 
 def test_m1_3_fail_after_delete_hook_order_pin() -> None:
     """Materialization source order: delete statement → inject → insert (main)."""
-    mat = (
-        ROOT / "src/dbt/include/repark/macros/materializations/incremental.sql"
-    ).read_text(encoding="utf-8")
+    mat = (ROOT / "src/dbt/include/repark/macros/materializations/incremental.sql").read_text(
+        encoding="utf-8"
+    )
     assert "repark_fail_after_delete" in mat
     assert "injected failure after delete" in mat
     assert "cannot be rolled back" in mat or "no-op" in mat
@@ -562,13 +810,16 @@ def test_m1_3_fail_after_delete_hook_order_pin() -> None:
 
 
 def test_m1_2_strategy_macros_source_pins() -> None:
-    """Macro source pins for loud refuse messages + delete vehicle shape."""
+    """Macro source pins for loud refuse messages + delete vehicle + insert_overwrite."""
     path = ROOT / "src/dbt/include/repark/macros/materializations/incremental_strategies.sql"
     text = path.read_text(encoding="utf-8")
     assert "repark_validate_incremental_strategy" in text
     assert "G3-M2" in text
-    assert "OQ-5" in text
     assert "insert_overwrite" in text
+    assert "repark_get_incremental_insert_overwrite_sql" in text
+    assert "insert overwrite" in text.lower()
+    assert "not exists" in text.lower()
+    assert "partition_by" in text
     assert "microbatch" in text
     assert "select distinct" in text.lower()
     assert "when matched then delete" in text.lower()
@@ -576,11 +827,16 @@ def test_m1_2_strategy_macros_source_pins() -> None:
     assert "cannot run as a single SQL string" in text
     # incremental_predicates plumbing present (not e2e-gated M1a — G3-M2 note in macro).
     assert "incremental_predicates" in text
+    # Dynamic composition residual documented (engine static OW).
+    assert "static whole-table" in text.lower() or "dynamic partition" in text.lower()
     mat = ROOT / "src/dbt/include/repark/macros/materializations/incremental.sql"
     mtext = mat.read_text(encoding="utf-8")
     assert "{% materialization incremental, adapter='repark' %}" in mtext
     assert "repark_fail_after_delete" in mtext
     assert "delete+insert" in mtext
+    assert "insert_overwrite" in mtext
+    adapters = (ROOT / "src/dbt/include/repark/macros/adapters.sql").read_text(encoding="utf-8")
+    assert "repark_partitioned_by_clause" in adapters
 
 
 def test_m1_2_dbt_run_refuses_delete_insert_without_unique_key(tmp_path: Path) -> None:
@@ -605,7 +861,6 @@ def test_m1_2_dbt_run_refuses_delete_insert_without_unique_key(tmp_path: Path) -
     ("strategy", "needle"),
     [
         ("merge", "G3-M2"),
-        ("insert_overwrite", "OQ-5"),
         ("weird_strategy", "not supported"),
     ],
 )
@@ -652,7 +907,7 @@ def test_m1_2_microbatch_refuse_non_vacuous(tmp_path: Path) -> None:
     joined = "\n".join(msgs)
     # Must be the adapter macro refuse — not only dbt-core's missing-config parse error.
     assert "dbt-repark refuses incremental_strategy='microbatch'" in joined, joined
-    assert "Supported strategies: append, delete+insert" in joined, joined
+    assert "Supported strategies: append, delete+insert, insert_overwrite" in joined, joined
 
 
 # ---------------------------------------------------------------------------

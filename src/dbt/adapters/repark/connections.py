@@ -187,9 +187,7 @@ class ReparkConnectionManager(SQLConnectionManager):
     @classmethod
     def _rollback_handle(cls, connection: Connection) -> None:
         """Documented no-op rollback — prior executes already committed eagerly."""
-        logger.debug(
-            "repark rollback: documented no-op (cannot undo eager engine statements)"
-        )
+        logger.debug("repark rollback: documented no-op (cannot undo eager engine statements)")
         handle = connection.handle
         if handle is not None and hasattr(handle, "rollback"):
             handle.rollback()
