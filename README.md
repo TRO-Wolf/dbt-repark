@@ -3,26 +3,31 @@
 dbt adapter for the [repark](https://github.com/TRO-Wolf/repark) pure-Rust Iceberg engine
 (**embedded**, no JVM). Adapter type in `profiles.yml`: **`repark`**.
 
-**Status:** M2a — connect + table + incremental (`append`, `delete+insert`,
-`insert_overwrite`, `merge`) + memory unit tests. Not a public release. No AWS merge gate
-in this unit (M2b / G3-M2b).
+**Status:** M2a+DML — connect + table + incremental (`append`, `delete+insert` via
+honest engine `DELETE`, `insert_overwrite`, `merge`) + memory unit tests. Not a public
+release. No AWS merge gate in this unit (M2b / G3-M2b).
 
 ## Install (pre-PyPI)
 
-```bash
-# 1) Build/install repark from a known git rev (path/editable). NEVER: pip install repark
-#    from PyPI while 0.0.1 is only a name-holding placeholder.
-cd /path/to/repark
-uv sync && make develop   # or: maturin develop / make build-wheel
+Engine pin for this adapter revision: repark
+`d9a739123be8b00bc1fc1e6d4bbad875ba6caa76`. Install that wheel **by absolute path**.
+NEVER `pip install repark` from PyPI while 0.0.1 is only a name-holding placeholder.
 
-# 2) Install this adapter editable into the same venv (or a dedicated one that can import repark)
+```bash
+# 1) Build the pinned repark wheel (checkout the SHA above)
+cd /path/to/repark
+make build-wheel
+# Wheel lands under target/wheels/repark-*.whl (maturin --release)
+
+# 2) Install this adapter + the wheel by absolute path into one venv
 cd /path/to/dbt-repark
 uv venv .venv && source .venv/bin/activate
 uv pip install -e ".[dev]"
-uv pip install -e /path/to/repark/python/repark   # if not already on PYTHONPATH via make develop
+uv pip install /ABS/PATH/TO/repark/target/wheels/repark-*.whl
 ```
 
-Record the repark git SHA used for each test run (start + PR time).
+Record the repark git SHA used for each test run (start + PR time). This revision's
+suite is gated against the SHA above, not a live worktree or an unpinned develop install.
 
 ## profiles.yml (type: repark)
 
@@ -83,7 +88,7 @@ duplicate source keys matching a target row) leaves the target table at its pre-
 for that statement (engine semantics; N-2 / N-2b corpora). This is **not** dbt `snapshot`
 materialization support.
 
-## Materializations (M0–M2a)
+## Materializations (M0–M2a+DML)
 
 | Mat | Behavior |
 |---|---|
@@ -92,25 +97,27 @@ materialization support.
 | **view** | **Loud refuse** — no durable Iceberg VIEW (G3-E2) |
 | **ephemeral** | Stock dbt CTE path |
 
-### Incremental strategies (M2a)
+### Incremental strategies (M2a+DML)
 
 | Strategy | Behavior |
 |---|---|
 | **`append`** (default) | Staging CTAS + `INSERT INTO … SELECT` (one insert execute on incremental runs) |
-| **`delete+insert`** | Staging CTAS + **delete** matching `unique_key` rows + **insert** batch — **two** eager executes; not atomic (see residual above). Requires `unique_key`. |
+| **`delete+insert`** | Staging CTAS + honest engine **`DELETE`** of matching `unique_key` rows + **insert** batch — **two** eager executes; not atomic (see residual above). Requires `unique_key`. Single-column key: `DELETE … WHERE key IN (SELECT key FROM staging)`. Composite key: `DELETE … WHERE EXISTS (SELECT 1 FROM staging s WHERE …)`. No tuple `IN`. |
 | **`insert_overwrite`** | Staging CTAS + one Spark-door `INSERT OVERWRITE` composed for **dynamic partition overwrite** (partitions present in the batch replaced; others left alone). Requires `partition_by` (identity column name or list). **Loud refuse** without `partition_by` (no overwrite-whole-table). See composition residual above. |
 | **`merge`** | Staging CTAS + one Spark-door **`MERGE INTO`** upsert (`WHEN MATCHED THEN UPDATE` + `WHEN NOT MATCHED THEN INSERT`). Requires `unique_key` (loud refuse without — no insert-only `ON FALSE` footgun). Engine duplicate-source-key semantics surface unchanged (`MERGE_CARDINALITY_VIOLATION` when a target row matches multiple source rows). |
 | **other / microbatch** | **Loud refuse** — not supported |
 
-`delete+insert` delete half uses Spark-door `MERGE … WHEN MATCHED THEN DELETE` as a
-**delete vehicle only** (engine `DELETE … WHERE key IN (SELECT …)` is incorrect today). That is
-**not** the G3-M2a merge incremental strategy (which is a combined upsert in one statement).
+`delete+insert` delete half is an honest Spark-door `DELETE` (repark #78 uncorrelated `IN`,
+#89 correlated `EXISTS`). `MERGE` is **not** the delete+insert vehicle; the G3-M2a **`merge`**
+strategy remains a combined upsert in one statement.
 
 Staging relations are **durable** Iceberg tables (`__dbt_tmp` suffix); the engine has no
 `TEMP TABLE` / `TEMP VIEW`. Materializations call `create_table_as(False, …)` for staging and
 drop temps after a successful run. **`create_table_as(temporary=True)` is refused loud** (M0
 pin restored) — there is no session-scoped temp table path. Optional `incremental_predicates`
-/`predicates` are plumbed into the delete+insert and merge ON clauses (not e2e-gated).
+/`predicates` ride inside the delete+insert `EXISTS` inner `WHERE` (`DBT_INTERNAL_DEST` /
+`DBT_INTERNAL_SOURCE` rewritten to `t`/`s`; engine still refuses mixed `AND`/`OR` around
+`IN`/`EXISTS`) and the merge `ON` clause (not e2e-gated).
 
 ### M2.2 residual — optional Spark extras (off / loud-gated)
 
