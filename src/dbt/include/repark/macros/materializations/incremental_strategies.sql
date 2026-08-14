@@ -1,7 +1,7 @@
 {#
-  Incremental strategy helpers for dbt-repark (G3-M1a + G3-M1b + G3-M2a).
-  Supported: append, delete+insert, insert_overwrite (partitioned, dynamic semantics),
-  merge (Spark-door MERGE INTO upsert, one eager execute).
+  Incremental strategy helpers for dbt-repark (G3-M1a + G3-M1b + G3-M2a + S-4 DML).
+  Supported: append, delete+insert (honest engine DELETE), insert_overwrite
+  (partitioned, dynamic semantics), merge (Spark-door MERGE INTO upsert, one eager execute).
   Unsupported (loud refuse): microbatch/other.
 #}
 
@@ -140,18 +140,26 @@
 
 {% macro repark_get_incremental_delete_sql(target_relation, temp_relation, unique_key, incremental_predicates=none) -%}
   {#
-    Delete half of delete+insert (one eager execute).
+    Delete half of delete+insert (one eager execute). Honest engine DELETE (A8).
 
-    Engine note: DELETE … WHERE key IN (SELECT …) currently removes *all* rows on repark
-    (incorrect). We therefore use MERGE … WHEN MATCHED THEN DELETE as a single-predicate
-    *delete vehicle* only — this is NOT the G3-M2a merge incremental strategy
-    (delete-only MERGE; insert is a separate execute, not combined upsert).
+    Single-column unique_key (no extra predicates):
+      DELETE FROM target WHERE key IN (SELECT key FROM staging)
+      — uncorrelated IN (#78-proven). The IN subquery is a plain column
+      projection (engine allow-list rejects DISTINCT there). Duplicate batch
+      keys are fine: DELETE is idempotent on the key set.
 
-    Source side is SELECT DISTINCT on unique_key columns so duplicate batch keys do not
-    trip MERGE_CARDINALITY_VIOLATION.
+    Composite unique_key:
+      DELETE FROM target AS t WHERE EXISTS (
+        SELECT 1 FROM staging AS s WHERE s.k1 = t.k1 AND …
+      )
+      — correlated EXISTS (#89-proven). No tuple IN (not a proven hole).
+      Aliases are short unquoted t/s (A8). Long mixed-case aliases like
+      DBT_INTERNAL_DEST break the identity SELECT (quoted alias vs folded refs).
 
-    incremental_predicates / predicates: optional extra ON-clause fragments plumbed through
-    (same shape as stock dbt delete+insert).
+    incremental_predicates / predicates: extra fragments cannot be AND-ed onto
+    the outer WHERE (engine still refuses mixed AND/OR around IN/EXISTS). They
+    ride inside the EXISTS inner WHERE with DBT_INTERNAL_DEST → t and
+    DBT_INTERNAL_SOURCE → s. Single-key + extras therefore uses EXISTS.
   #}
   {%- if unique_key is string -%}
     {%- set unique_key_list = [unique_key] -%}
@@ -159,31 +167,36 @@
     {%- set unique_key_list = unique_key -%}
   {%- endif -%}
 
-  {%- set key_cols = [] -%}
-  {%- for key in unique_key_list -%}
-    {%- do key_cols.append(adapter.quote(key)) -%}
-  {%- endfor -%}
-  {%- set key_cols_csv = key_cols | join(', ') -%}
-
-  {%- set predicates = [] -%}
-  {%- for key in unique_key_list -%}
-    {%- do predicates.append(
-          'DBT_INTERNAL_DEST.' ~ adapter.quote(key) ~ ' = DBT_INTERNAL_SOURCE.' ~ adapter.quote(key)
-        ) -%}
-  {%- endfor -%}
-  {%- if incremental_predicates -%}
-    {%- for predicate in incremental_predicates -%}
-      {%- do predicates.append(predicate) -%}
+  {%- if unique_key_list | length == 1 and not incremental_predicates -%}
+    {%- set key_q = adapter.quote(unique_key_list[0]) -%}
+delete from {{ target_relation }}
+where {{ key_q }} in (
+  select {{ key_q }}
+  from {{ temp_relation }}
+)
+  {%- else -%}
+    {%- set predicates = [] -%}
+    {%- for key in unique_key_list -%}
+      {%- do predicates.append(
+            's.' ~ adapter.quote(key) ~ ' = t.' ~ adapter.quote(key)
+          ) -%}
     {%- endfor -%}
+    {%- if incremental_predicates -%}
+      {%- for predicate in incremental_predicates -%}
+        {%- do predicates.append(
+              predicate
+                | replace('DBT_INTERNAL_DEST', 't')
+                | replace('DBT_INTERNAL_SOURCE', 's')
+            ) -%}
+      {%- endfor -%}
+    {%- endif -%}
+delete from {{ target_relation }} as t
+where exists (
+  select 1
+  from {{ temp_relation }} as s
+  where {{ predicates | join(' and ') }}
+)
   {%- endif -%}
-
-  merge into {{ target_relation }} as DBT_INTERNAL_DEST
-  using (
-    select distinct {{ key_cols_csv }}
-    from {{ temp_relation }}
-  ) as DBT_INTERNAL_SOURCE
-  on {{ predicates | join(' and ') }}
-  when matched then delete
 {%- endmacro %}
 
 

@@ -217,6 +217,24 @@ def _dbt_invoke(
     return result, msgs
 
 
+def _target_mentions(project: Path, needle: str) -> bool:
+    """True if any dbt target artifact contains *needle* (case-insensitive)."""
+    target = project / "target"
+    if not target.is_dir():
+        return False
+    want = needle.lower()
+    for path in target.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if want in text.lower():
+            return True
+    return False
+
+
 def test_valid_incremental_strategies_pin() -> None:
     # Unbound call — method does not use instance state (discovery surface only).
     strategies = ReparkAdapter.valid_incremental_strategies(None)  # type: ignore[arg-type]
@@ -315,7 +333,7 @@ def test_m1_1_delete_insert_dbt_runner_twice_arrow(tmp_path: Path) -> None:
             + "\n",
             encoding="utf-8",
         )
-        r2, _ = _dbt_invoke(project, profiles)
+        r2, msgs2 = _dbt_invoke(project, profiles, "--log-level", "debug")
         assert r2.success, r2.exception
 
         session = next(iter(shared.values()))
@@ -324,6 +342,10 @@ def test_m1_1_delete_insert_dbt_runner_twice_arrow(tmp_path: Path) -> None:
             "select id, v from spark_catalog.default.inc_di order by id",
         )
         assert out == [(1, "keep"), (2, "new"), (3, "added")], out
+        joined = "\n".join(msgs2)
+        # Second run must execute honest DELETE IN, not MERGE-as-delete.
+        assert "delete from" in joined.lower() or _target_mentions(project, "delete from")
+        assert "when matched then delete" not in joined.lower()
 
 
 def test_m1_1_delete_insert_multi_key_dbt_runner(tmp_path: Path) -> None:
@@ -361,7 +383,7 @@ def test_m1_1_delete_insert_multi_key_dbt_runner(tmp_path: Path) -> None:
             + "\n",
             encoding="utf-8",
         )
-        r2, _ = _dbt_invoke(project, profiles)
+        r2, msgs2 = _dbt_invoke(project, profiles, "--log-level", "debug")
         assert r2.success, r2.exception
 
         session = next(iter(shared.values()))
@@ -370,6 +392,9 @@ def test_m1_1_delete_insert_multi_key_dbt_runner(tmp_path: Path) -> None:
             "select a, b, v from spark_catalog.default.inc_mk order by a",
         )
         assert out == [(1, "x", 11), (2, "y", 20)], out
+        joined = "\n".join(msgs2)
+        assert "exists" in joined.lower() or _target_mentions(project, "exists")
+        assert "when matched then delete" not in joined.lower()
 
 
 def test_m1_1_delete_insert_duplicate_batch_keys_dbt_runner(tmp_path: Path) -> None:
@@ -810,7 +835,7 @@ def test_m1_3_fail_after_delete_hook_order_pin() -> None:
 
 
 def test_m1_2_strategy_macros_source_pins() -> None:
-    """Macro source pins for loud refuse messages + delete vehicle + insert_overwrite + merge."""
+    """Macro source pins for loud refuse messages + honest DELETE + insert_overwrite + merge."""
     path = ROOT / "src/dbt/include/repark/macros/materializations/incremental_strategies.sql"
     text = path.read_text(encoding="utf-8")
     assert "repark_validate_incremental_strategy" in text
@@ -821,13 +846,11 @@ def test_m1_2_strategy_macros_source_pins() -> None:
     assert "not exists" in text.lower()
     assert "partition_by" in text
     assert "microbatch" in text
-    assert "select distinct" in text.lower()
-    assert "when matched then delete" in text.lower()
     assert "cannot run as a single SQL string" in text
     assert "incremental_predicates" in text
     # Dynamic composition residual documented (engine static OW).
     assert "static whole-table" in text.lower() or "dynamic partition" in text.lower()
-    # G3-M2a merge strategy emits full upsert (not delete-only vehicle).
+    # G3-M2a merge strategy emits full upsert (not a delete+insert vehicle).
     assert "repark_get_incremental_merge_sql" in text
     assert "when matched then update set" in text.lower()
     assert "when not matched then insert" in text.lower()
@@ -842,6 +865,40 @@ def test_m1_2_strategy_macros_source_pins() -> None:
     adapters = (ROOT / "src/dbt/include/repark/macros/adapters.sql").read_text(encoding="utf-8")
     assert "repark_partitioned_by_clause" in adapters
     assert "incremental_strategy == 'merge'" in mtext or "repark_get_incremental_merge_sql" in mtext
+
+
+def test_s4_delete_sql_spelling_source_pins() -> None:
+    """A8: delete+insert emits honest DELETE IN / EXISTS; MERGE is not the vehicle."""
+    path = ROOT / "src/dbt/include/repark/macros/materializations/incremental_strategies.sql"
+    text = path.read_text(encoding="utf-8")
+    start = text.index("{% macro repark_get_incremental_delete_sql")
+    end = text.index("{% macro repark_get_incremental_merge_sql")
+    delete_macro = text[start:end]
+    assert "delete from" in delete_macro.lower()
+    assert " in (" in delete_macro.lower()
+    assert "exists (" in delete_macro.lower()
+    assert "select 1" in delete_macro.lower()
+    assert "merge into" not in delete_macro.lower()
+    assert "when matched then delete" not in delete_macro.lower()
+    assert "select distinct" not in delete_macro.lower()
+    # No invented tuple IN.
+    assert "tuple" not in delete_macro.lower() or "no tuple" in delete_macro.lower()
+    assert "({{ key_cols_csv }})" not in delete_macro
+
+
+def test_s4_merge_strategy_macro_untouched() -> None:
+    """M2a merge upsert stays a separate strategy (byte-stable contract pins)."""
+    path = ROOT / "src/dbt/include/repark/macros/materializations/incremental_strategies.sql"
+    text = path.read_text(encoding="utf-8")
+    start = text.index("{% macro repark_get_incremental_merge_sql")
+    end = text.index("{% macro repark__get_incremental_default_sql")
+    merge_macro = text[start:end]
+    assert "merge into {{ target_relation }} as DBT_INTERNAL_DEST" in merge_macro
+    assert "when matched then update set" in merge_macro.lower()
+    assert "when not matched then insert" in merge_macro.lower()
+    assert "MERGE_CARDINALITY_VIOLATION" in merge_macro
+    assert "when matched then delete" not in merge_macro.lower()
+    assert "delete from" not in merge_macro.lower()
 
 
 def test_m1_2_dbt_run_refuses_delete_insert_without_unique_key(tmp_path: Path) -> None:

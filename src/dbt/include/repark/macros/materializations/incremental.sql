@@ -1,7 +1,8 @@
 {% materialization incremental, adapter='repark' %}
   {#
-    G3-M1a/M1b/M2a: append + delete+insert + insert_overwrite (partitioned dynamic) + merge.
-    delete+insert is two separate executes (not atomic — plan §1.5).
+    G3-M1a/M1b/M2a + S-4: append + delete+insert + insert_overwrite (partitioned dynamic) + merge.
+    delete+insert is two separate executes (not atomic — plan §1.5): honest engine DELETE
+    (IN for a single unique_key; EXISTS for a composite unique_key), then INSERT.
     Failure after delete leaves matching keys removed and nothing inserted.
     Injected failure (repark_fail_after_delete) also leaves the durable __dbt_tmp staging table.
     insert_overwrite is one INSERT OVERWRITE execute synthesizing dynamic partition overwrite
