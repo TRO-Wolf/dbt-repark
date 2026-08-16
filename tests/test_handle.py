@@ -46,12 +46,23 @@ def test_cursor_rejects_bindings() -> None:
         cur.execute("select 1", bindings=(1,))
 
 
-def test_handle_close_stops_session() -> None:
+def test_handle_close_releases_without_stopping_session() -> None:
+    """U-1 inverts the pre-fix pin: close() must NOT stop the process session.
+
+    The memory catalog lives in the session and dbt closes a connection between nodes, so
+    stopping here made every relation connection-ephemeral. Teardown is
+    ``ReparkConnectionManager.close_all()`` (atexit), never handle close.
+    """
     session = _FakeSession()
     handle = ReparkConnectionHandle(session)
     handle.cursor().execute("select 1")
     handle.close()
-    assert session.stopped is True
+    assert session.stopped is False
+    # The session stays usable for the next connection dbt opens.
+    assert handle.session is session
+    handle.session.sql("select 1")
+    with pytest.raises(RuntimeError, match="closed"):
+        handle.cursor()
 
 
 def test_handle_rollback_is_noop() -> None:

@@ -8,7 +8,7 @@ import sys
 import tempfile
 import textwrap
 from collections.abc import Iterator
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
@@ -79,37 +79,19 @@ def _session_table_names(session: Any) -> set[str]:
 
 @contextmanager
 def _shared_memory_session() -> Iterator[dict[str, Any]]:
-    """Reuse one memory-catalog session across dbtRunner invokes (process-local catalog).
+    """Scope guard over the adapter's own process session registry.
 
-    Memory catalogs are empty per new ReparkSession. Tests that need a real second
-    incremental run share one session and soft-close handles so dbt does not stop it.
+    Memory catalogs are empty per new ReparkSession, so a real second incremental run
+    needs the session to outlive the connection dbt closes between nodes. Before U-1 this
+    helper had to monkeypatch ``_open_session`` and soft-close handles to fake that; the
+    adapter now caches one session per credentials key and never stops it on handle close,
+    so this only yields the live registry and tears it down afterwards.
     """
-    shared: dict[str, Any] = {}
-    orig_open = ReparkConnectionManager._open_session.__func__  # type: ignore[attr-defined]
-    orig_close = ReparkConnectionHandle.close
-
-    def shared_open(cls: type, credentials: ReparkCredentials) -> Any:
-        key = str(credentials.warehouse or "default")
-        if key not in shared:
-            shared[key] = orig_open(cls, credentials)
-        return shared[key]
-
-    def soft_close(self: ReparkConnectionHandle) -> None:
-        # Mark closed for dbt lifecycle without stopping the shared process session.
-        self._closed = True
-
-    ReparkConnectionManager._open_session = classmethod(shared_open)  # type: ignore[method-assign]
-    ReparkConnectionHandle.close = soft_close  # type: ignore[method-assign]
+    ReparkConnectionManager.close_all()
     try:
-        yield shared
+        yield ReparkConnectionManager.live_sessions()
     finally:
-        ReparkConnectionManager._open_session = classmethod(orig_open)  # type: ignore[method-assign]
-        ReparkConnectionHandle.close = orig_close  # type: ignore[method-assign]
-        for sess in shared.values():
-            stop = getattr(sess, "stop", None)
-            if callable(stop):
-                with suppress(Exception):
-                    stop()
+        ReparkConnectionManager.close_all()
 
 
 def _write_mini_project(
