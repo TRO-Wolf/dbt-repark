@@ -86,12 +86,20 @@ class ReparkConnectionHandle:
         return ReparkCursor(self._session)
 
     def close(self) -> None:
+        """Release this handle. **Never** stops the engine session (U-1).
+
+        The engine session is process-scoped and owned by
+        :class:`~dbt.adapters.repark.connections.ReparkConnectionManager`'s session
+        registry, not by any one handle. dbt closes a connection between nodes; on
+        ``catalog_type: memory`` the Iceberg catalog *lives in the session*, so stopping
+        it here made every relation a prior node created disappear (``dbt build`` on a
+        two-node project failed, ``dbt run`` then ``dbt test`` failed, snapshots could not
+        resolve ``ref()``). Session teardown is
+        ``ReparkConnectionManager.close_all()``, wired to ``atexit``.
+        """
         if self._closed:
             return
         self._closed = True
-        stop = getattr(self._session, "stop", None)
-        if callable(stop):
-            stop()
 
     def rollback(self) -> None:
         """Documented no-op (M0.8). Eager ``sql()`` commits cannot be undone."""

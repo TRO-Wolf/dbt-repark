@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import atexit
 import tempfile
+import threading
+import warnings
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +29,52 @@ logger = AdapterLogger("repark")
 # Adapter-level default materialization for operator docs / M0.3 (dbt NodeConfig still defaults
 # to view; projects must set +materialized: table — sample_project does; view mat refuses).
 DEFAULT_MATERIALIZATION = "table"
+
+# -----------------------------------------------------------------------------------------
+# U-1 session registry — one ReparkSession per credentials key, per process.
+#
+# The engine session is process-scoped: on ``catalog_type: memory`` the Iceberg catalog lives
+# inside it, and ``ReparkSession.builder…getOrCreate()`` is a process-global singleton whose
+# catalog registrations are fixed at build time. dbt closes a connection between nodes, so a
+# per-handle session (the pre-U-1 behaviour) made every relation connection-ephemeral.
+#
+# Precedent: dbt-duckdb keeps one ``Environment`` on the connection manager and tears it down
+# with ``DuckDBConnectionManager.close_all_connections`` registered on ``atexit`` — handle
+# close never touches the database. This mirrors that shape.
+# -----------------------------------------------------------------------------------------
+_SESSION_LOCK = threading.RLock()
+_SESSIONS: dict[tuple[str, str, str, str, str], Any] = {}
+
+# Identity fields of a profile that decide which engine session it needs. ``schema`` is
+# deliberately absent: namespaces are created per connection under one shared catalog.
+_SESSION_KEY_FIELDS = (
+    "catalog_type",
+    "catalog_name",
+    "warehouse",
+    "table_bucket_arn",
+    "aws_profile_name",
+)
+
+# Engine warning emitted when ``getOrCreate`` hands back a session someone else built and
+# this builder's configuration was therefore NOT applied (repark facade, session_core).
+_REUSE_WARNING_NEEDLE = "using an existing reparksession"
+
+
+def _session_key(credentials: ReparkCredentials) -> tuple[str, str, str, str, str]:
+    """Identity of the engine session a profile needs (never includes secret material)."""
+    return (
+        (credentials.catalog_type or "").strip().lower(),
+        credentials.catalog_name or "",
+        str(credentials.warehouse or ""),
+        str(credentials.table_bucket_arn or ""),
+        str(credentials.aws_profile_name or ""),
+    )
+
+
+def _describe_key(key: tuple[str, str, str, str, str]) -> str:
+    return " ".join(
+        f"{name}={value!r}" for name, value in zip(_SESSION_KEY_FIELDS, key, strict=True)
+    )
 
 
 class ReparkConnectionManager(SQLConnectionManager):
@@ -49,7 +98,9 @@ class ReparkConnectionManager(SQLConnectionManager):
 
         credentials = cls.get_credentials(connection.credentials)
         try:
-            session = cls._open_session(credentials)
+            # U-1: one process session per credentials key; handles are cheap references.
+            session = cls.get_or_create_session(credentials)
+            cls._ensure_namespace(session, credentials)
             connection.handle = ReparkConnectionHandle(session)
             connection.state = ConnectionState.OPEN
         except FailedToConnectError:
@@ -62,6 +113,142 @@ class ReparkConnectionManager(SQLConnectionManager):
             logger.debug("repark open failed: %s", exc)
             raise FailedToConnectError(str(exc)) from exc
         return connection
+
+    # -------------------------------------------------------------------------
+    # U-1 session lifetime: registry, teardown, and the reuse/mismatch refuses.
+    # -------------------------------------------------------------------------
+
+    @classmethod
+    def get_or_create_session(cls, credentials: ReparkCredentials) -> Any:
+        """Return the process session for *credentials*, building it on first use.
+
+        Refuses loud rather than handing back a session bound to a different catalog:
+        the embedded ``ReparkSession`` is process-global and its catalog registration is
+        fixed at build time, so a second profile in one process would silently read and
+        write the *first* profile's warehouse.
+        """
+        key = _session_key(credentials)
+        with _SESSION_LOCK:
+            cached = _SESSIONS.get(key)
+            if cached is not None:
+                return cached
+            if _SESSIONS:
+                live = next(iter(_SESSIONS))
+                raise FailedToConnectError(
+                    "dbt-repark refuses a second repark target in one process: the embedded "
+                    "ReparkSession is process-global and its catalog registration is fixed at "
+                    "session build, so this connection would silently read and write the "
+                    "already-open warehouse.\n"
+                    f"  already open: {_describe_key(live)}\n"
+                    f"  requested:    {_describe_key(key)}\n"
+                    "Run one target per dbt process, or call "
+                    "ReparkConnectionManager.close_all() before switching targets."
+                )
+            session = cls._open_session(credentials)
+            _SESSIONS[key] = session
+            return session
+
+    @classmethod
+    def live_sessions(cls) -> dict[tuple[str, str, str, str, str], Any]:
+        """Live view of the process session registry (introspection / tests)."""
+        return _SESSIONS
+
+    @classmethod
+    def close_all(cls) -> None:
+        """Stop every cached engine session. The adapter teardown hook (U-1).
+
+        Registered on ``atexit`` (dbt-duckdb precedent:
+        ``DuckDBConnectionManager.close_all_connections``). Never called per node and never
+        called from handle close — those are exactly the paths that destroyed the memory
+        catalog mid-run.
+        """
+        with _SESSION_LOCK:
+            sessions = list(_SESSIONS.values())
+            _SESSIONS.clear()
+        for session in sessions:
+            stop = getattr(session, "stop", None)
+            if callable(stop):
+                with suppress(Exception):
+                    stop()
+
+    def cleanup_all(self) -> None:
+        """Close dbt's connections; the engine session deliberately survives (U-1).
+
+        dbt calls this from the ``finally`` of every task invocation
+        (``dbt/task/runnable.py``), i.e. once per ``dbt run`` / ``dbt test`` / ``dbt build``
+        — **not** once per process. Stopping the session here would put the catalog back
+        on a per-invocation lifetime and break ``dbt run`` followed by ``dbt test`` inside
+        one process. Session teardown is :meth:`close_all` on ``atexit``; memory catalogs
+        stay honestly *process*-ephemeral (G3-E1), never connection-ephemeral.
+        """
+        super().cleanup_all()
+
+    @classmethod
+    def _ensure_namespace(cls, session: Any, credentials: ReparkCredentials) -> None:
+        """Create the connection's Iceberg namespace under the shared catalog."""
+        catalog = credentials.catalog_name
+        schema = credentials.schema
+        try:
+            session.sql(f"CREATE NAMESPACE IF NOT EXISTS {catalog}.{schema}")
+        except Exception as exc:
+            # IF NOT EXISTS may vary; retry without IF NOT EXISTS when already present is fine.
+            logger.debug("CREATE NAMESPACE note: %s", exc)
+
+    @classmethod
+    def _get_or_create_engine_session(cls, builder: Any, credentials: ReparkCredentials) -> Any:
+        """``builder.getOrCreate()`` that refuses a session it does not own (§5.4).
+
+        The engine warns — and then carries on — when ``getOrCreate`` hands back an existing
+        session whose already-registered catalogs keep their own configuration. Silently
+        accepting that means writing to a warehouse other than the one in ``profiles.yml``.
+        Read the warning instead of ignoring it.
+        """
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            session = builder.getOrCreate()
+
+        for record in caught:
+            text = str(record.message)
+            if _REUSE_WARNING_NEEDLE in text.lower():
+                raise FailedToConnectError(
+                    "dbt-repark refuses to reuse a ReparkSession it does not own: engine knobs "
+                    "and catalog registrations are fixed at session build, so this profile's "
+                    "configuration was not applied and the connection would target whatever "
+                    "warehouse the live session was built with.\n"
+                    f"  profiles.yml asked for: {_describe_key(_session_key(credentials))}\n"
+                    f"  engine warning: {text}\n"
+                    "Build the repark session through dbt only, or call "
+                    "ReparkConnectionManager.close_all() before reconnecting."
+                )
+            # Not ours to swallow — re-emit anything else the engine had to say.
+            warnings.warn_explicit(
+                record.message, record.category, record.filename, record.lineno
+            )
+        return session
+
+    @classmethod
+    def _verify_catalog_binding(
+        cls, session: Any, *, catalog: str, suffix: str, expected: str
+    ) -> None:
+        """Refuse loud when the live session's catalog config is not what the profile asked for."""
+        key = f"spark.sql.catalog.{catalog}.{suffix}"
+        conf = getattr(session, "conf", None)
+        if conf is None or not hasattr(conf, "get"):
+            return
+        try:
+            live = conf.get(key)
+        except Exception as exc:  # engine may not expose the key; not a mismatch signal
+            logger.debug("repark conf.get(%s) unavailable: %s", key, exc)
+            return
+        if live is None or str(live) == str(expected):
+            return
+        raise FailedToConnectError(
+            f"dbt-repark session catalog mismatch on {key}: the live engine session is bound to "
+            f"{live!r} but profiles.yml asked for {expected!r}. The embedded ReparkSession fixes "
+            "catalog registration at build time, so continuing would read and write the wrong "
+            "warehouse. Run one target per dbt process, or call "
+            "ReparkConnectionManager.close_all() before switching targets."
+        )
 
     @classmethod
     def _open_session(cls, credentials: ReparkCredentials) -> Any:
@@ -89,7 +276,10 @@ class ReparkConnectionManager(SQLConnectionManager):
                 .config(f"spark.sql.catalog.{catalog}.warehouse", str(warehouse))
                 .config("spark.sql.defaultCatalog", catalog)
             )
-            session = builder.getOrCreate()
+            session = cls._get_or_create_engine_session(builder, credentials)
+            cls._verify_catalog_binding(
+                session, catalog=catalog, suffix="warehouse", expected=str(warehouse)
+            )
         elif kind == "glue":
             builder = (
                 builder.config(f"spark.sql.catalog.{catalog}", catalog_impl)
@@ -102,7 +292,10 @@ class ReparkConnectionManager(SQLConnectionManager):
                 import os
 
                 os.environ.setdefault("AWS_PROFILE", credentials.aws_profile_name)
-            session = builder.getOrCreate()
+            session = cls._get_or_create_engine_session(builder, credentials)
+            cls._verify_catalog_binding(
+                session, catalog=catalog, suffix="warehouse", expected=str(credentials.warehouse)
+            )
         elif kind == "s3tables":
             arn = credentials.table_bucket_arn
             builder = (
@@ -115,17 +308,13 @@ class ReparkConnectionManager(SQLConnectionManager):
                 import os
 
                 os.environ.setdefault("AWS_PROFILE", credentials.aws_profile_name)
-            session = builder.getOrCreate()
+            session = cls._get_or_create_engine_session(builder, credentials)
+            cls._verify_catalog_binding(
+                session, catalog=catalog, suffix="table_bucket_arn", expected=str(arn)
+            )
         else:
             raise FailedToConnectError(f"unsupported catalog_type={credentials.catalog_type!r}")
 
-        # Ensure the dbt schema (Iceberg namespace) exists for memory/dev convenience.
-        schema = credentials.schema
-        try:
-            session.sql(f"CREATE NAMESPACE IF NOT EXISTS {catalog}.{schema}")
-        except Exception as exc:
-            # IF NOT EXISTS may vary; retry without IF NOT EXISTS when already present is fine.
-            logger.debug("CREATE NAMESPACE note: %s", exc)
         return session
 
     @classmethod
@@ -201,3 +390,8 @@ class ReparkConnectionManager(SQLConnectionManager):
         except Exception as exc:
             logger.debug("repark query error on sql=%s: %s", sql[:200], exc)
             raise DbtRuntimeError(str(exc)) from exc
+
+
+# U-1 teardown hook: the process — not a handle, not a dbt task — owns session lifetime.
+# dbt-duckdb precedent: atexit.register(DuckDBConnectionManager.close_all_connections).
+atexit.register(ReparkConnectionManager.close_all)

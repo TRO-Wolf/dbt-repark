@@ -16,6 +16,13 @@ dbt adapter for the [repark](https://github.com/TRO-Wolf/repark) embedded Iceber
 - `README.md` — operator contract (M2a+DML status; engine wheel pin).
 - `pyproject.toml` — package metadata. `repark` is **not** a PyPI dependency.
 
+## Session lifetime (U-1)
+
+One `ReparkSession` per credentials key, per process, cached in a registry on
+`ReparkConnectionManager`. Handle close **releases**; `close_all()` on `atexit` stops. A
+second target in one process refuses loud (the engine session is a process singleton whose
+catalog registration is fixed at build time). Memory catalogs stay *process*-ephemeral.
+
 ## Incremental DML (S-4)
 
 `delete+insert` emits honest engine `DELETE` (`IN` / `EXISTS`). The M2a `merge` strategy is a

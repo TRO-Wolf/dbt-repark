@@ -3,9 +3,10 @@
 dbt adapter for the [repark](https://github.com/TRO-Wolf/repark) pure-Rust Iceberg engine
 (**embedded**, no JVM). Adapter type in `profiles.yml`: **`repark`**.
 
-**Status:** M2a+DML — connect + table + incremental (`append`, `delete+insert` via
-honest engine `DELETE`, `insert_overwrite`, `merge`) + memory unit tests. Not a public
-release. No AWS merge gate in this unit (M2b / G3-M2b).
+**Status:** M2a+DML+U-1 — connect + table + incremental (`append`, `delete+insert` via
+honest engine `DELETE`, `insert_overwrite`, `merge`) + process-scoped session lifetime
+(multi-node `dbt build` works) + memory unit tests. Not a public release. No AWS merge gate
+in this unit (M2b / G3-M2b).
 
 ## Install (pre-PyPI)
 
@@ -51,6 +52,40 @@ repark_mem:
 - **Loud refuse** any static key/secret/session-token fields in `profiles.yml` (and nested `aws:` blocks).
 - Do **not** equate engine tier-2 CI OIDC with operator profiles.
 - Manual/AWS acceptance (M0b): scratch/non-prod namespace + warehouse; verify LocationUri binding.
+
+### Session lifetime (U-1)
+
+**One `ReparkSession` per credentials key, per process.** The adapter caches sessions in a
+module-level registry keyed by the profile's identity fields (`catalog_type`,
+`catalog_name`, `warehouse`, `table_bucket_arn`, `aws_profile_name` — never `schema`, never
+secret material). Closing a dbt connection **releases the handle and does not stop the
+session**; the session is stopped once, at process exit, via
+`ReparkConnectionManager.close_all()` registered on `atexit` (the dbt-duckdb
+`close_all_connections` shape).
+
+This is a correctness requirement, not an optimisation. On `catalog_type: memory` the
+Iceberg catalog **lives in the session**, and dbt closes a connection between nodes — so a
+per-connection session made every relation *connection*-ephemeral: `dbt build` on a
+two-node project failed with `table … not found`, `dbt run` then `dbt test` failed, and
+`ref()` could not resolve.
+
+| Scope | Memory catalog |
+|---|---|
+| Between nodes of one `dbt build` | **survives** |
+| Between `dbt run` and `dbt test` in one process | **survives** |
+| Across processes (two CLI invocations) | **empty** — G3-E1, unchanged and by design |
+
+Memory catalogs remain honestly **process**-ephemeral. Do not read this as durability; use
+Glue / S3 Tables for a catalog that outlives the process.
+
+**One target per process (loud refuse).** The embedded `ReparkSession` is a process-global
+singleton whose catalog registration is fixed at build time. A second connection asking for
+a different `warehouse` / `table_bucket_arn` / `catalog_type` **refuses loud, naming both
+values**, instead of silently reading and writing the first target's warehouse. The adapter
+also reads the engine's `Using an existing ReparkSession; some configuration may not apply`
+warning — previously ignored — and refuses rather than accepting a session it does not own.
+Switching targets in one process means a new process, or an explicit
+`ReparkConnectionManager.close_all()`.
 
 ### Transactions (§1.5 honesty)
 
